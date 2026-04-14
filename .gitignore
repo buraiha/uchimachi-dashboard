@@ -1,0 +1,16 @@
+/target
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Secrets and local runtime data
+secrets/
+data/*
+!data/.gitkeep
+
+# Editor / OS artifacts
+.DS_Store
+Thumbs.db
+*.log

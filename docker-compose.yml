@@ -1,0 +1,19 @@
+services:
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID}
+      DASHBOARD_TITLE: ${DASHBOARD_TITLE:-うちまちダッシュボード}
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET}
+      GOOGLE_OAUTH_REDIRECT_URL: ${GOOGLE_OAUTH_REDIRECT_URL:-http://localhost:8080/auth/callback}
+      GOOGLE_TOKEN_STORE_PATH: ${GOOGLE_TOKEN_STORE_PATH:-/data/google-oauth-token.json}
+      MESSAGE_DB_PATH: ${MESSAGE_DB_PATH:-/data/dashboard.sqlite3}
+      GOOGLE_MAX_RESULTS: ${GOOGLE_MAX_RESULTS:-10}
+      PORT: ${PORT:-8080}
+    volumes:
+      - ./data:/data

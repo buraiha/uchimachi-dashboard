@@ -1,0 +1,12 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^cargo check$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^docker compose up --build -d --force-recreate$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}
