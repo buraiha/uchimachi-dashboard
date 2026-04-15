@@ -8,6 +8,8 @@ Google Calendar API から特定のカレンダーの今後のイベントを取
 - `GET /auth/login` で Google ログイン開始
 - `GET /auth/callback` で OAuth コールバック受信
 - `GET /auth/status` で認可状態確認
+- `GET /user/login` と `POST /user/login` で利用者ログイン
+- `GET /user/logout` と `POST /user/logout` で利用者ログアウト
 - `GET /` と `GET /dashboard` で表示用ダッシュボード
 - `GET /messages` で有効な伝言一覧を取得
 - `POST /messages` で1-24時間有効な伝言を登録
@@ -54,9 +56,14 @@ GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
 GOOGLE_OAUTH_REDIRECT_URL=http://localhost:8080/auth/callback
 GOOGLE_TOKEN_STORE_PATH=/data/google-oauth-token.json
 MESSAGE_DB_PATH=/data/dashboard.sqlite3
+DASHBOARD_AUTH_USERNAME=dashboard-user
+DASHBOARD_AUTH_PASSWORD=change-this-password
+DASHBOARD_AUTH_COOKIE_SECURE=false
 GOOGLE_MAX_RESULTS=10
 PORT=8080
 ```
+
+`DASHBOARD_AUTH_USERNAME` と `DASHBOARD_AUTH_PASSWORD` を両方設定すると、ダッシュボード利用者向けのログインが有効になります。両方未設定なら従来どおり公開動作です。HTTPS 配下で運用する場合は `DASHBOARD_AUTH_COOKIE_SECURE=true` を指定してください。
 
 1. サービスを起動
 
@@ -68,13 +75,14 @@ docker compose up -d --build
 
 1. ブラウザで認可を実行
 
-`http://localhost:8080/auth/login` にアクセスして Google ログインと同意を完了します。
+利用者認証を有効にした場合は、先に `http://localhost:8080/user/login` でログインします。その後 `http://localhost:8080/auth/login` にアクセスして Google ログインと同意を完了します。
 
 1. 別ターミナルから確認
 
 ```bash
 open http://localhost:8080/
 curl http://localhost:8080/health
+curl -c cookies.txt -d 'username=dashboard-user&password=change-this-password' -X POST http://localhost:8080/user/login -i
 curl http://localhost:8080/auth/status | jq
 curl http://localhost:8080/messages | jq
 curl http://localhost:8080/calendar | jq
@@ -106,6 +114,8 @@ docker compose up -d --build
 
 - `GOOGLE_OAUTH_REDIRECT_URL` は本番サーバーの公開URLに合わせて変更が必要です
 - Google Cloud 側の OAuth クライアントにも、その本番URLのコールバック先を承認済みリダイレクト URI として登録する必要があります
+- 利用者認証を使うなら `DASHBOARD_AUTH_USERNAME` と `DASHBOARD_AUTH_PASSWORD` を必ず設定してください
+- HTTPS 経由で公開するなら `DASHBOARD_AUTH_COOKIE_SECURE=true` にしてください
 - 初回だけブラウザで `/auth/login` を開いて認可を完了してください
 
 ## ローカル実行
@@ -120,6 +130,9 @@ export GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
 export GOOGLE_OAUTH_REDIRECT_URL=http://localhost:8080/auth/callback
 export GOOGLE_TOKEN_STORE_PATH=./data/google-oauth-token.json
 export MESSAGE_DB_PATH=./data/dashboard.sqlite3
+export DASHBOARD_AUTH_USERNAME=dashboard-user
+export DASHBOARD_AUTH_PASSWORD=change-this-password
+export DASHBOARD_AUTH_COOKIE_SECURE=false
 export GOOGLE_MAX_RESULTS=10
 export PORT=8080
 
@@ -157,6 +170,7 @@ cargo run
 
 - この sandbox は読み取り専用スコープ `calendar.readonly` を使います
 - access token は refresh token から必要時に再取得します
+- 利用者認証はメモリ上のセッション Cookie で管理されるため、再起動後は再ログインが必要です
 - ダッシュボードタイトルは `DASHBOARD_TITLE` で変更できます
 - 伝言は登録時に1-24時間の有効時間を選べて、SQLite3 ファイルとしてホスト側の data 配下に保存されます
 - refresh token を再発行したい場合は `data/google-oauth-token.json` を削除して `/auth/login` をやり直してください

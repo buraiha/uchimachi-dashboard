@@ -1,8 +1,9 @@
 use anyhow::{Context, anyhow};
 use axum::{
     Json, Router,
-    extract::{Form, Query, State},
-    http::{StatusCode, header},
+    extract::{Form, Query, Request, State},
+    http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -27,12 +28,16 @@ const DASHBOARD_MAX_RESULTS_LIMIT: u32 = 40;
 const DEFAULT_MESSAGE_TTL_HOURS: i64 = 12;
 const MIN_MESSAGE_TTL_HOURS: i64 = 1;
 const MAX_MESSAGE_TTL_HOURS: i64 = 24;
+const USER_LOGIN_PATH: &str = "/user/login";
+const USER_LOGOUT_PATH: &str = "/user/logout";
+const USER_SESSION_COOKIE_NAME: &str = "uchimachi_dashboard_session";
 
 #[derive(Clone)]
 struct AppState {
     client: Client,
     config: Arc<Config>,
     pending_states: Arc<Mutex<HashSet<String>>>,
+    user_sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -46,6 +51,14 @@ struct Config {
     oauth_redirect_url: String,
     token_store_path: String,
     message_db_path: String,
+    user_auth: Option<UserAuthConfig>,
+}
+
+#[derive(Clone)]
+struct UserAuthConfig {
+    username: String,
+    password: String,
+    cookie_secure: bool,
 }
 
 impl Config {
@@ -68,6 +81,15 @@ impl Config {
             .unwrap_or_else(|_| "./data/google-oauth-token.json".to_string());
         let message_db_path = env::var("MESSAGE_DB_PATH")
             .unwrap_or_else(|_| derive_message_db_path(&token_store_path));
+        let auth_username = read_optional_trimmed_env("DASHBOARD_AUTH_USERNAME");
+        let auth_password = env::var("DASHBOARD_AUTH_PASSWORD")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let auth_cookie_secure = env::var("DASHBOARD_AUTH_COOKIE_SECURE")
+            .ok()
+            .map(|value| parse_bool_env("DASHBOARD_AUTH_COOKIE_SECURE", &value))
+            .transpose()?
+            .unwrap_or(false);
 
         let max_results = env::var("GOOGLE_MAX_RESULTS")
             .ok()
@@ -83,6 +105,20 @@ impl Config {
             .context("PORT must be a valid u16")?
             .unwrap_or(8080);
 
+        let user_auth = match (auth_username, auth_password) {
+            (Some(username), Some(password)) => Some(UserAuthConfig {
+                username,
+                password,
+                cookie_secure: auth_cookie_secure,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(anyhow!(
+                    "DASHBOARD_AUTH_USERNAME and DASHBOARD_AUTH_PASSWORD must be set together"
+                ));
+            }
+        };
+
         Ok(Self {
             calendar_id,
             dashboard_title,
@@ -93,7 +129,12 @@ impl Config {
             oauth_redirect_url,
             token_store_path,
             message_db_path,
+            user_auth,
         })
+    }
+
+    fn user_auth_enabled(&self) -> bool {
+        self.user_auth.is_some()
     }
 }
 
@@ -102,6 +143,7 @@ struct ServiceInfo {
     service: &'static str,
     calendar_id: String,
     authorized: bool,
+    user_auth_enabled: bool,
     endpoints: Vec<&'static str>,
 }
 
@@ -113,8 +155,10 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct AuthStatusResponse {
     authorized: bool,
+    user_auth_enabled: bool,
     token_store_path: String,
     login_path: &'static str,
+    user_login_path: &'static str,
 }
 
 #[derive(Serialize)]
@@ -149,6 +193,18 @@ struct AuthCallbackQuery {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UserLoginQuery {
+    next: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserLoginForm {
+    username: String,
+    password: String,
+    next: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,21 +357,31 @@ async fn main() -> anyhow::Result<()> {
             .context("failed to build HTTP client")?,
         config: Arc::clone(&config),
         pending_states: Arc::new(Mutex::new(HashSet::new())),
+        user_sessions: Arc::new(Mutex::new(HashSet::new())),
     };
 
     init_message_db(&config.message_db_path).await?;
 
-    let app = Router::new()
+    let protected_routes = Router::new()
         .route("/", get(dashboard))
         .route("/dashboard", get(dashboard))
-        .route("/api/info", get(service_info))
         .route("/messages", get(list_messages).post(create_message))
         .route("/messages/manage", get(messages_manage_page).post(messages_manage_action))
-        .route("/health", get(health))
         .route("/auth/login", get(auth_login))
-        .route("/auth/callback", get(auth_callback))
         .route("/auth/status", get(auth_status))
         .route("/calendar", get(calendar_events))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_user_auth,
+        ));
+
+    let app = Router::new()
+        .merge(protected_routes)
+        .route("/api/info", get(service_info))
+        .route("/health", get(health))
+        .route("/auth/callback", get(auth_callback))
+        .route(USER_LOGIN_PATH, get(user_login_page).post(user_login_submit))
+        .route(USER_LOGOUT_PATH, get(user_logout).post(user_logout))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
@@ -364,6 +430,7 @@ async fn dashboard(
                         selected_max_results,
                         &events,
                         &messages,
+                        state.config.user_auth_enabled(),
                     ),
                     Err(error) => render_dashboard_message(
                         &state.config.dashboard_title,
@@ -399,6 +466,7 @@ async fn service_info(State(state): State<AppState>) -> Utf8Json<ServiceInfo> {
         service: "uchimachi-dashboard",
         calendar_id: state.config.calendar_id.clone(),
         authorized: token_file_exists(&state.config.token_store_path).await,
+        user_auth_enabled: state.config.user_auth_enabled(),
         endpoints: vec![
             "GET /",
             "GET /dashboard",
@@ -412,6 +480,10 @@ async fn service_info(State(state): State<AppState>) -> Utf8Json<ServiceInfo> {
             "GET /auth/status",
             "GET /health",
             "GET /calendar",
+            "GET /user/login",
+            "POST /user/login",
+            "GET /user/logout",
+            "POST /user/logout",
         ],
     })
 }
@@ -423,9 +495,118 @@ async fn health() -> Utf8Json<HealthResponse> {
 async fn auth_status(State(state): State<AppState>) -> Utf8Json<AuthStatusResponse> {
     Utf8Json(AuthStatusResponse {
         authorized: token_file_exists(&state.config.token_store_path).await,
+        user_auth_enabled: state.config.user_auth_enabled(),
         token_store_path: state.config.token_store_path.clone(),
         login_path: "/auth/login",
+        user_login_path: USER_LOGIN_PATH,
     })
+}
+
+async fn user_login_page(
+    State(state): State<AppState>,
+    Query(query): Query<UserLoginQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.config.user_auth_enabled() {
+        return Redirect::to("/dashboard").into_response();
+    }
+
+    let next_path = sanitize_next_path(query.next.as_deref());
+    if has_valid_user_session(&state, &headers).await {
+        return Redirect::to(&next_path).into_response();
+    }
+
+    Html(render_user_login_page(
+        &state.config.dashboard_title,
+        None,
+        &next_path,
+    ))
+    .into_response()
+}
+
+async fn user_login_submit(
+    State(state): State<AppState>,
+    Form(payload): Form<UserLoginForm>,
+) -> Response {
+    if !state.config.user_auth_enabled() {
+        return Redirect::to("/dashboard").into_response();
+    }
+
+    let next_path = sanitize_next_path(payload.next.as_deref());
+    let Some(auth) = state.config.user_auth.as_ref() else {
+        return Redirect::to("/dashboard").into_response();
+    };
+
+    if payload.username != auth.username || payload.password != auth.password {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(render_user_login_page(
+                &state.config.dashboard_title,
+                Some("ユーザー名またはパスワードが正しくありません。"),
+                &next_path,
+            )),
+        )
+            .into_response();
+    }
+
+    let session_id = Uuid::new_v4().to_string();
+    state.user_sessions.lock().await.insert(session_id.clone());
+
+    (
+        [(header::SET_COOKIE, build_user_session_cookie(&state.config, &session_id))],
+        Redirect::to(&next_path),
+    )
+        .into_response()
+}
+
+async fn user_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(session_id) = extract_cookie_value(&headers, USER_SESSION_COOKIE_NAME) {
+        state.user_sessions.lock().await.remove(&session_id);
+    }
+
+    (
+        [(header::SET_COOKIE, clear_user_session_cookie())],
+        Redirect::to(USER_LOGIN_PATH),
+    )
+        .into_response()
+}
+
+async fn require_user_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !state.config.user_auth_enabled() {
+        return next.run(request).await;
+    }
+
+    if has_valid_user_session(&state, request.headers()).await {
+        return next.run(request).await;
+    }
+
+    let path_and_query = request
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/");
+
+    if is_browser_route(request.uri().path()) {
+        let location = format!(
+            "{path}?next={next}",
+            path = USER_LOGIN_PATH,
+            next = urlencoding::encode(path_and_query),
+        );
+        return Redirect::to(&location).into_response();
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Utf8Json(serde_json::json!({
+            "error": "authentication required",
+            "login_path": USER_LOGIN_PATH,
+        })),
+    )
+        .into_response()
 }
 
 async fn list_messages(
@@ -471,7 +652,10 @@ async fn create_message(
 
 async fn messages_manage_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let active_messages = load_active_messages(&state).await?;
-    Ok(Html(render_message_manage_page(&active_messages)))
+    Ok(Html(render_message_manage_page(
+        &active_messages,
+        state.config.user_auth_enabled(),
+    )))
 }
 
 async fn messages_manage_action(
@@ -795,6 +979,7 @@ fn render_dashboard_page(
     selected_max_results: u32,
     events: &GoogleCalendarEventsResponse,
     messages: &[StoredMessage],
+    user_auth_enabled: bool,
 ) -> String {
     let sections = build_dashboard_sections(events, messages);
 
@@ -805,6 +990,14 @@ fn render_dashboard_page(
     let upcoming_rows =
         render_upcoming_event_rows(&sections.upcoming_events, "明後日以降の予定はありません");
     let max_results_options = render_dashboard_max_results_options(selected_max_results);
+    let session_actions = if user_auth_enabled {
+        format!(
+            r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="hero-logout">ログアウト</button></form>"#,
+            logout_path = USER_LOGOUT_PATH,
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         r#"<!DOCTYPE html>
@@ -899,6 +1092,17 @@ fn render_dashboard_page(
             gap: 10px;
             margin-left: auto;
             white-space: nowrap;
+        }}
+        .hero-logout {{
+            appearance: none;
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            border-radius: 999px;
+            padding: 10px 16px;
+            background: rgba(255,255,255,0.82);
+            color: var(--ink);
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
         }}
         .hero-control-label {{
             font-size: 13px;
@@ -1152,6 +1356,7 @@ fn render_dashboard_page(
                         {max_results_options}
                     </select>
                 </form>
+                {session_actions}
             </div>
         </section>
         <section class="content">
@@ -1424,6 +1629,7 @@ fn render_dashboard_page(
         reload_seconds = DASHBOARD_RELOAD_SECONDS,
         message_cards = message_cards,
         max_results_options = max_results_options,
+        session_actions = session_actions,
         today_label = escape_html(&sections.today_label),
         tomorrow_label = escape_html(&sections.tomorrow_label),
         today_cards = today_cards,
@@ -1432,8 +1638,16 @@ fn render_dashboard_page(
     )
 }
 
-fn render_message_manage_page(messages: &[StoredMessage]) -> String {
+fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: bool) -> String {
     let create_ttl_options = render_ttl_option_tags(DEFAULT_MESSAGE_TTL_HOURS);
+    let session_actions = if user_auth_enabled {
+        format!(
+            r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="secondary-button">ログアウト</button></form>"#,
+            logout_path = USER_LOGOUT_PATH,
+        )
+    } else {
+        String::new()
+    };
     let items = if messages.is_empty() {
         "<div class=\"manage-empty\">現在有効な伝言はありません</div>".to_string()
     } else {
@@ -1580,6 +1794,7 @@ fn render_message_manage_page(messages: &[StoredMessage]) -> String {
                 <p class="subtitle">追加・更新・削除ができます。伝言ごとに1-24時間の有効時間を選べて、更新時は現在時刻から再計算します。</p>
                 <div class="toolbar">
                     <a class="link-button" href="/dashboard">ダッシュボードに戻る</a>
+                    {session_actions}
                 </div>
             </div>
             <div class="panel-body">
@@ -1612,7 +1827,144 @@ fn render_message_manage_page(messages: &[StoredMessage]) -> String {
 </body>
 </html>"#,
         create_ttl_options = create_ttl_options,
+        session_actions = session_actions,
         items = items,
+    )
+}
+
+fn render_user_login_page(
+    dashboard_title: &str,
+    error_message: Option<&str>,
+    next_path: &str,
+) -> String {
+    let error_markup = error_message
+        .map(|message| {
+            format!(
+                r#"<div class="error-banner">{message}</div>"#,
+                message = escape_html(message),
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{title}</title>
+    <style>
+        :root {{
+            --bg: #f7f1e3;
+            --panel: rgba(255, 252, 245, 0.94);
+            --line: rgba(56, 42, 30, 0.14);
+            --ink: #2f241b;
+            --muted: #7a6757;
+            --accent: #c55c3b;
+            --accent-soft: #efdbc8;
+            --error-bg: rgba(197, 92, 59, 0.12);
+            --error-line: rgba(197, 92, 59, 0.24);
+            --shadow: 0 24px 70px rgba(77, 54, 33, 0.14);
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at top left, rgba(255, 214, 167, 0.9), transparent 28%),
+                radial-gradient(circle at bottom right, rgba(205, 116, 82, 0.24), transparent 24%),
+                linear-gradient(135deg, #fbf4e6 0%, #f4eadf 45%, #efe4d7 100%);
+        }}
+        .panel {{
+            width: min(460px, 100%);
+            border: 1px solid var(--line);
+            border-radius: 28px;
+            background: var(--panel);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }}
+        .panel-head {{ padding: 24px 26px 18px; border-bottom: 1px solid var(--line); }}
+        .panel-body {{ padding: 22px 24px 24px; }}
+        .eyebrow {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--accent);
+            background: var(--accent-soft);
+        }}
+        .title {{ margin: 12px 0 8px; font-size: 30px; line-height: 1.1; }}
+        .subtitle {{ margin: 0; color: var(--muted); line-height: 1.6; }}
+        .login-form {{ display: grid; gap: 14px; }}
+        .login-label {{ display: grid; gap: 8px; font-weight: 700; }}
+        .login-input {{
+            width: 100%;
+            padding: 12px 14px;
+            border-radius: 16px;
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            background: rgba(255,255,255,0.88);
+            font: inherit;
+            color: inherit;
+        }}
+        .primary-button {{
+            appearance: none;
+            border: none;
+            border-radius: 999px;
+            padding: 12px 18px;
+            background: var(--accent);
+            color: #fff;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+        }}
+        .error-banner {{
+            margin-bottom: 14px;
+            padding: 12px 14px;
+            border-radius: 16px;
+            border: 1px solid var(--error-line);
+            background: var(--error-bg);
+            color: var(--accent);
+            font-weight: 700;
+        }}
+    </style>
+</head>
+<body>
+    <main class="panel">
+        <section class="panel-head">
+            <span class="eyebrow">User</span>
+            <h1 class="title">利用者ログイン</h1>
+            <p class="subtitle">{dashboard_title} を開くには、利用者アカウントで認証してください。</p>
+        </section>
+        <section class="panel-body">
+            {error_markup}
+            <form class="login-form" method="post" action="{login_path}">
+                <input type="hidden" name="next" value="{next_path}">
+                <label class="login-label">ユーザー名
+                    <input class="login-input" type="text" name="username" autocomplete="username" required>
+                </label>
+                <label class="login-label">パスワード
+                    <input class="login-input" type="password" name="password" autocomplete="current-password" required>
+                </label>
+                <button class="primary-button" type="submit">ログイン</button>
+            </form>
+        </section>
+    </main>
+</body>
+</html>"#,
+        title = escape_html(dashboard_title),
+        dashboard_title = escape_html(dashboard_title),
+        error_markup = error_markup,
+        login_path = USER_LOGIN_PATH,
+        next_path = escape_html(next_path),
     )
 }
 
@@ -1905,6 +2257,83 @@ fn parse_calendar_timezone(value: Option<&str>) -> Tz {
     value
         .and_then(|time_zone| time_zone.parse::<Tz>().ok())
         .unwrap_or(chrono_tz::Asia::Tokyo)
+}
+
+fn read_optional_trimmed_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_bool_env(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(anyhow!("{name} must be one of true/false/1/0/yes/no/on/off")),
+    }
+}
+
+async fn has_valid_user_session(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(session_id) = extract_cookie_value(headers, USER_SESSION_COOKIE_NAME) else {
+        return false;
+    };
+
+    state.user_sessions.lock().await.contains(&session_id)
+}
+
+fn extract_cookie_value(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookie_header.split(';').find_map(|entry| {
+        let (name, value) = entry.trim().split_once('=')?;
+        if name == cookie_name {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn build_user_session_cookie(config: &Config, session_id: &str) -> String {
+    let secure = config
+        .user_auth
+        .as_ref()
+        .filter(|auth| auth.cookie_secure)
+        .map(|_| "; Secure")
+        .unwrap_or("");
+
+    format!(
+        "{name}={value}; Path=/; HttpOnly; SameSite=Lax{secure}",
+        name = USER_SESSION_COOKIE_NAME,
+        value = session_id,
+        secure = secure,
+    )
+}
+
+fn clear_user_session_cookie() -> String {
+    format!(
+        "{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT",
+        name = USER_SESSION_COOKIE_NAME,
+    )
+}
+
+fn is_browser_route(path: &str) -> bool {
+    matches!(path, "/" | "/dashboard" | "/messages/manage" | "/auth/login")
+}
+
+fn sanitize_next_path(candidate: Option<&str>) -> String {
+    let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "/dashboard".to_string();
+    };
+
+    if !candidate.starts_with('/')
+        || candidate.starts_with("//")
+        || candidate.starts_with(USER_LOGIN_PATH)
+    {
+        return "/dashboard".to_string();
+    }
+
+    candidate.to_string()
 }
 
 fn format_date_header(date: NaiveDate) -> String {
