@@ -269,6 +269,7 @@ struct DashboardEvent {
 struct DashboardMessage {
     message: String,
     registered_at_label: String,
+    expires_at_label: String,
 }
 
 struct DashboardSections {
@@ -550,6 +551,18 @@ async fn user_login_submit(
     }
 
     let session_id = Uuid::new_v4().to_string();
+    
+    // データベースにセッションを保存
+    if let Err(e) = save_session_to_db(&state.config.message_db_path, &session_id).await {
+        tracing::error!("Failed to save session to db: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Html("セッション保存に失敗しました"),
+        )
+        .into_response();
+    }
+
+    // メモリ内にも保持（後方互換性のため）
     state.user_sessions.lock().await.insert(session_id.clone());
 
     (
@@ -561,7 +574,13 @@ async fn user_login_submit(
 
 async fn user_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(session_id) = extract_cookie_value(&headers, USER_SESSION_COOKIE_NAME) {
+        // メモリから削除
         state.user_sessions.lock().await.remove(&session_id);
+        
+        // データベースからも削除
+        if let Err(e) = remove_session_from_db(&state.config.message_db_path, &session_id).await {
+            tracing::error!("Failed to remove session from db: {}", e);
+        }
     }
 
     (
@@ -983,6 +1002,7 @@ fn render_dashboard_page(
 ) -> String {
     let sections = build_dashboard_sections(events, messages);
 
+    let has_messages = !sections.messages.is_empty();
     let message_cards = render_message_cards(&sections.messages, "現在有効な伝言はありません");
     let today_cards = render_primary_event_cards(&sections.today_events, "本日の予定はありません");
     let tomorrow_cards =
@@ -997,6 +1017,12 @@ fn render_dashboard_page(
         )
     } else {
         String::new()
+    };
+
+    let (message_group_style, message_head_margin, message_title_font_size) = if has_messages {
+        ("margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid rgba(56, 42, 30, 0.1);", "12px", "18px")
+    } else {
+        ("margin-bottom: 0px; padding-bottom: 1px;", "1px", "11px")
     };
 
     format!(
@@ -1021,7 +1047,7 @@ fn render_dashboard_page(
         * {{ box-sizing: border-box; }}
         html, body {{ height: 100%; margin: 0; }}
         body {{
-            overflow: hidden;
+            overflow: auto;
             font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
             color: var(--ink);
             background:
@@ -1032,12 +1058,12 @@ fn render_dashboard_page(
         .shell {{
             display: grid;
             grid-template-columns: minmax(0, 1fr);
-            grid-template-rows: auto minmax(0, 1fr);
+            grid-template-rows: auto auto;
             grid-template-areas:
                 "hero"
                 "content";
             gap: 22px;
-            height: 100vh;
+            min-height: 100vh;
             padding: 22px;
         }}
         .panel {{
@@ -1057,7 +1083,7 @@ fn render_dashboard_page(
         .content {{
             grid-area: content;
             display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
+            grid-template-columns: minmax(0, 1fr);
             gap: 22px;
             min-height: 0;
             align-items: stretch;
@@ -1067,7 +1093,7 @@ fn render_dashboard_page(
             gap: 22px;
             min-height: 0;
         }}
-        .left-stack {{ grid-template-rows: auto auto; }}
+        .left-stack {{ grid-template-rows: auto; }}
         .right-stack {{ grid-template-rows: auto auto; }}
         .hero {{ padding: 26px 28px 22px; }}
         .panel-head {{
@@ -1085,6 +1111,7 @@ fn render_dashboard_page(
             display: grid;
             gap: 8px;
             min-width: 0;
+            text-align: left;
         }}
         .hero-controls {{
             display: flex;
@@ -1136,9 +1163,8 @@ fn render_dashboard_page(
         .title {{ margin: 0; font-size: 32px; line-height: 1.1; font-weight: 800; }}
         .countdown {{ margin: 0; font-size: 14px; font-weight: 700; color: var(--accent); }}
         .subtitle {{ margin: 0; color: var(--muted); font-size: 15px; line-height: 1.6; }}
-        .panel-body {{ height: 100%; overflow: auto; padding: 22px 24px 24px; }}
-        .schedule-body {{ padding: 14px 20px 18px; }}
-        .schedule-body {{ overflow: hidden; }}
+        .panel-body {{ overflow: auto; padding: 22px 24px 24px; }}
+        .schedule-body {{ padding: 14px 20px 18px; overflow: auto; }}
         .panel-body::-webkit-scrollbar {{ width: 10px; }}
         .panel-body::-webkit-scrollbar-thumb {{ background: rgba(90, 66, 41, 0.18); border-radius: 999px; }}
         .section-title {{ margin: 0; font-size: 28px; line-height: 1.15; font-weight: 800; }}
@@ -1197,8 +1223,8 @@ fn render_dashboard_page(
         .empty {{
             display: grid;
             place-items: center;
-            min-height: 180px;
-            padding: 24px;
+            min-height: 30px;
+            padding: 4px;
             border-radius: 22px;
             border: 1px dashed rgba(101, 76, 53, 0.2);
             color: var(--muted);
@@ -1258,13 +1284,13 @@ fn render_dashboard_page(
             }}
             .content {{ gap: 16px; }}
             .column-stack {{ gap: 16px; }}
-            .left-stack {{ grid-template-rows: auto auto; }}
+            .left-stack {{ grid-template-rows: auto; }}
             .right-stack {{ grid-template-rows: auto auto; }}
             .hero {{ padding: 18px 20px; }}
             .panel-head {{ padding: 16px 18px 14px; }}
             .panel-body {{ padding: 16px 18px 18px; }}
             .schedule-body {{ padding: 10px 14px 14px; }}
-            .schedule-body {{ max-height: 42vh; overflow: auto; }}
+            .schedule-body {{ overflow: auto; }}
             .head-inline {{ gap: 10px; }}
             .head-copy {{ gap: 6px; }}
             .hero-controls {{ gap: 8px; }}
@@ -1277,8 +1303,8 @@ fn render_dashboard_page(
             .section-date, .subtitle {{ font-size: 13px; }}
             .message-body {{ font-size: 16px; }}
             .message-registered {{ font-size: 12px; }}
-            .empty {{ min-height: 120px; padding: 18px; }}
-            .panel-body {{ max-height: none; }}
+            .empty {{ min-height: 25px; padding: 3px; }}
+            .panel-body {{ overflow: auto; }}
             .primary-list {{
                 height: auto;
                 min-height: unset;
@@ -1310,9 +1336,6 @@ fn render_dashboard_page(
             }}
         }}
         @media (max-width: 768px) {{
-            .content {{
-                grid-template-columns: 1fr;
-            }}
             .head-inline {{
                 flex-direction: column;
                 align-items: flex-start;
@@ -1334,7 +1357,8 @@ fn render_dashboard_page(
             }}
             .hero-panel {{ width: 100%; min-width: 0; }}
             .column-stack {{ grid-template-rows: auto auto; }}
-            .panel-body {{ max-height: 46vh; }}
+            .left-stack {{ grid-template-rows: auto; }}
+            .panel-body {{ overflow: auto; }}
             .schedule-body {{ overflow: auto; }}
         }}
     </style>
@@ -1360,66 +1384,59 @@ fn render_dashboard_page(
             </div>
         </section>
         <section class="content">
-            <div class="column-stack left-stack">
-                <section class="panel">
-                    <div class="panel-head">
-                        <div class="head-inline">
-                            <span class="eyebrow">Message</span>
-                            <div class="head-copy">
-                                <h2 class="section-title">伝言</h2>
-                                <p class="section-date">1-24時間で設定した期限を過ぎると自動的に消えます ・ <a href="/messages/manage" style="color:inherit;">編集</a></p>
-                            </div>
+            <section class="panel">
+                <div class="panel-head">
+                    <div class="head-inline">
+                        <span class="eyebrow">Today</span>
+                        <div class="head-copy">
+                            <h2 class="section-title">今日の予定</h2>
+                            <p class="section-date">{today_label}</p>
                         </div>
                     </div>
-                    <div class="panel-body">
-                        <div class="message-group">{message_cards}</div>
-                    </div>
-                </section>
-                <section class="panel">
-                    <div class="panel-head">
-                        <div class="head-inline">
-                            <span class="eyebrow">Today</span>
-                            <div class="head-copy">
-                                <h2 class="section-title">今日の予定</h2>
-                                <p class="section-date">{today_label}</p>
+                </div>
+                <div class="panel-body schedule-body">
+                    <div class="message-group" style="{message_group_style}">
+                        <div class="message-head">
+                            <div style="display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: {message_head_margin};">
+                                <h3 style="margin: 0; font-size: {message_title_font_size}; font-weight: 800; color: var(--accent);">伝言</h3>
+                                <span style="font-size: 12px; color: var(--muted);">
+                                    <a href="/messages/manage" style="color: inherit; text-decoration: none;">編集</a>
+                                </span>
                             </div>
                         </div>
+                        {message_cards}
                     </div>
-                    <div class="panel-body schedule-body">
-                        {today_cards}
-                    </div>
-                </section>
-            </div>
-            <div class="column-stack right-stack">
-                <section class="panel">
-                    <div class="panel-head">
-                        <div class="head-inline">
-                            <span class="eyebrow">Tomorrow</span>
-                            <div class="head-copy">
-                                <h2 class="section-title">明日の予定</h2>
-                                <p class="section-date">{tomorrow_label}</p>
-                            </div>
+                    {today_cards}
+                </div>
+            </section>
+            <section class="panel">
+                <div class="panel-head">
+                    <div class="head-inline">
+                        <span class="eyebrow">Tomorrow</span>
+                        <div class="head-copy">
+                            <h2 class="section-title">明日の予定</h2>
+                            <p class="section-date">{tomorrow_label}</p>
                         </div>
                     </div>
-                    <div class="panel-body schedule-body">
-                        {tomorrow_cards}
-                    </div>
-                </section>
-                <aside class="panel column-upcoming">
-                    <div class="panel-head">
-                        <div class="head-inline">
-                            <span class="eyebrow">Upcoming</span>
-                            <div class="head-copy">
-                                <h2 class="section-title">明後日以降の予定</h2>
-                                <p class="subtitle">日付、時間、タイトルを時系列で確認できます。</p>
-                            </div>
+                </div>
+                <div class="panel-body schedule-body">
+                    {tomorrow_cards}
+                </div>
+            </section>
+            <aside class="panel column-upcoming">
+                <div class="panel-head">
+                    <div class="head-inline">
+                        <span class="eyebrow">Upcoming</span>
+                        <div class="head-copy">
+                            <h2 class="section-title">明後日以降の予定</h2>
+                            <p class="subtitle">日付、時間、タイトルを時系列で確認できます。</p>
                         </div>
                     </div>
-                    <div class="panel-body schedule-body">
-                        {upcoming_rows}
-                    </div>
-                </aside>
-            </div>
+                </div>
+                <div class="panel-body schedule-body">
+                    {upcoming_rows}
+                </div>
+            </aside>
         </section>
     </main>
     <script>
@@ -1628,6 +1645,9 @@ fn render_dashboard_page(
         display_title = escape_html(dashboard_title),
         reload_seconds = DASHBOARD_RELOAD_SECONDS,
         message_cards = message_cards,
+        message_group_style = message_group_style,
+        message_head_margin = message_head_margin,
+        message_title_font_size = message_title_font_size,
         max_results_options = max_results_options,
         session_actions = session_actions,
         today_label = escape_html(&sections.today_label),
@@ -2066,6 +2086,9 @@ fn build_dashboard_sections(
                 registered_at_label: format_registered_at(
                     message.created_at.with_timezone(&timezone),
                 ),
+                expires_at_label: format_registered_at(
+                    message.expires_at.with_timezone(&timezone),
+                ),
             })
             .collect(),
         today_events,
@@ -2201,9 +2224,10 @@ fn render_message_cards(messages: &[DashboardMessage], empty_message: &str) -> S
         .iter()
         .map(|message| {
             format!(
-                r#"<article class="message-card"><div class="message-body">{body}</div><div class="message-registered">登録日時: {registered_at}</div></article>"#,
+                r#"<article class="message-card"><div class="message-body">{body}</div><div class="message-registered">登録日時: {registered_at} / 有効期限: {expires_at}</div></article>"#,
                 body = escape_html(&message.message),
                 registered_at = escape_html(&message.registered_at_label),
+                expires_at = escape_html(&message.expires_at_label),
             )
         })
         .collect::<Vec<_>>()
@@ -2279,7 +2303,19 @@ async fn has_valid_user_session(state: &AppState, headers: &HeaderMap) -> bool {
         return false;
     };
 
-    state.user_sessions.lock().await.contains(&session_id)
+    // まずメモリ内をチェック（高速）
+    if state.user_sessions.lock().await.contains(&session_id) {
+        return true;
+    }
+
+    // メモリ内にない場合はデータベースをチェック
+    if is_valid_session_in_db(&state.config.message_db_path, &session_id).await {
+        // データベースにある場合はメモリ内にも追加（キャッシュ）
+        state.user_sessions.lock().await.insert(session_id);
+        return true;
+    }
+
+    false
 }
 
 fn extract_cookie_value(headers: &HeaderMap, cookie_name: &str) -> Option<String> {
@@ -2302,10 +2338,14 @@ fn build_user_session_cookie(config: &Config, session_id: &str) -> String {
         .map(|_| "; Secure")
         .unwrap_or("");
 
+    // 30日間のCookie有効期限を設定（30 * 24 * 60 * 60 = 2,592,000秒）
+    let max_age = 30 * 24 * 60 * 60;
+
     format!(
-        "{name}={value}; Path=/; HttpOnly; SameSite=Lax{secure}",
+        "{name}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
         name = USER_SESSION_COOKIE_NAME,
         value = session_id,
+        max_age = max_age,
         secure = secure,
     )
 }
@@ -2452,6 +2492,11 @@ async fn init_message_db(message_db_path: &str) -> anyhow::Result<()> {
             "CREATE TABLE IF NOT EXISTS messages (
                 id TEXT PRIMARY KEY,
                 message TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                session_id TEXT PRIMARY KEY,
                 created_at_ms INTEGER NOT NULL,
                 expires_at_ms INTEGER NOT NULL
             );",
@@ -2618,4 +2663,67 @@ fn escape_html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+// セッション管理関数
+async fn save_session_to_db(message_db_path: &str, session_id: &str) -> anyhow::Result<()> {
+    let db_path = message_db_path.to_string();
+    let session_id = session_id.to_string();
+    let now = Utc::now().timestamp_millis();
+    let expires_at = now + (30 * 24 * 60 * 60 * 1000); // 30日後
+
+    task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = open_message_db(&db_path)?;
+        // 期限切れセッションをクリーンアップ
+        connection.execute(
+            "DELETE FROM user_sessions WHERE expires_at_ms < ?1",
+            params![now],
+        )?;
+        // 新しいセッションを保存
+        connection.execute(
+            "INSERT OR REPLACE INTO user_sessions (session_id, created_at_ms, expires_at_ms) VALUES (?1, ?2, ?3)",
+            params![session_id, now, expires_at],
+        )?;
+        Ok(())
+    })
+    .await
+    .context("failed to join session save task")??;
+
+    Ok(())
+}
+
+async fn is_valid_session_in_db(message_db_path: &str, session_id: &str) -> bool {
+    let db_path = message_db_path.to_string();
+    let session_id = session_id.to_string();
+    let now = Utc::now().timestamp_millis();
+
+    task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let connection = open_message_db(&db_path)?;
+        let mut stmt = connection.prepare(
+            "SELECT 1 FROM user_sessions WHERE session_id = ?1 AND expires_at_ms > ?2"
+        )?;
+        let exists = stmt.exists(params![session_id, now])?;
+        Ok(exists)
+    })
+    .await
+    .unwrap_or(Ok(false))
+    .unwrap_or(false)
+}
+
+async fn remove_session_from_db(message_db_path: &str, session_id: &str) -> anyhow::Result<()> {
+    let db_path = message_db_path.to_string();
+    let session_id = session_id.to_string();
+
+    task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = open_message_db(&db_path)?;
+        connection.execute(
+            "DELETE FROM user_sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    })
+    .await
+    .context("failed to join session remove task")??;
+
+    Ok(())
 }

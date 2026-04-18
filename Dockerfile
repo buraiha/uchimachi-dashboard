@@ -1,4 +1,4 @@
-FROM rust:1.89-slim AS builder
+FROM docker.io/library/rust:1.89-slim AS builder
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libsqlite3-dev \
