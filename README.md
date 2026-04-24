@@ -32,7 +32,7 @@ Google Calendar API から特定のカレンダーの今後のイベントを取
 4. テスト公開のまま使うなら、認可に使う Google アカウントを `テストユーザー` に追加
 5. `認証情報` -> `認証情報を作成` -> `OAuth クライアント ID`
 6. アプリケーションの種類は `ウェブアプリケーション`
-7. 承認済みのリダイレクト URI に `http://localhost:8080/auth/callback` を追加
+7. 承認済みのリダイレクト URI に `https://your-domain.com/auth/callback` を追加
 8. 発行された Client ID と Client Secret を控える
 
 認可に使う Google アカウント自体が対象カレンダーを見られないと、認証が成功してもカレンダー取得で 404 または権限エラーになります。
@@ -53,7 +53,7 @@ GOOGLE_CALENDAR_ID=your-calendar-id@group.calendar.google.com
 DASHBOARD_TITLE=うちまちダッシュボード
 GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
 GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
-GOOGLE_OAUTH_REDIRECT_URL=http://localhost:8080/auth/callback
+GOOGLE_OAUTH_REDIRECT_URL=https://your-domain.com/auth/callback
 GOOGLE_TOKEN_STORE_PATH=/data/google-oauth-token.json
 MESSAGE_DB_PATH=/data/dashboard.sqlite3
 DASHBOARD_AUTH_USERNAME=dashboard-user
