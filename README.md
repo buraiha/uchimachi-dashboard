@@ -1,6 +1,6 @@
 # うちまちダッシュボード
 
-Google Calendar API から特定のカレンダーの今後のイベントを取得する Rust 製の ダッシュボード です。Docker Compose で HTTP サービスとして起動し、OAuth 2.0 のユーザー認可で Google にログインして利用します。
+Google Calendar API から複数のカレンダーの今後のイベントを取得する Rust 製のダッシュボードです。Docker Compose で HTTP サービスとして起動し、OAuth 2.0 のユーザー認可で Google にログインして利用します。
 
 ## できること
 
@@ -11,6 +11,8 @@ Google Calendar API から特定のカレンダーの今後のイベントを取
 - `GET /user/login` と `POST /user/login` で利用者ログイン
 - `GET /user/logout` と `POST /user/logout` で利用者ログアウト
 - `GET /` と `GET /dashboard` で表示用ダッシュボード
+- `GET /calendars/manage` と `POST /calendars/manage` で表示対象カレンダーを登録・更新・削除
+  予定タイトル用のプレフィックスも任意で設定可能
 - `GET /messages` で有効な伝言一覧を取得
 - `POST /messages` で1-24時間有効な伝言を登録
 - `GET /calendar` で対象カレンダーの今後のイベントを取得
@@ -49,7 +51,6 @@ mkdir -p data
 1. `.env` を編集
 
 ```dotenv
-GOOGLE_CALENDAR_ID=your-calendar-id@group.calendar.google.com
 DASHBOARD_TITLE=うちまちダッシュボード
 GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
 GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
@@ -62,6 +63,8 @@ DASHBOARD_AUTH_COOKIE_SECURE=false
 GOOGLE_MAX_RESULTS=10
 PORT=8080
 ```
+
+カレンダー ID は `.env` ではなく、起動後にダッシュボードの `カレンダー設定` から登録します。登録内容は `MESSAGE_DB_PATH` の SQLite に保存されます。
 
 `DASHBOARD_AUTH_USERNAME` と `DASHBOARD_AUTH_PASSWORD` を両方設定すると、ダッシュボード利用者向けのログインが有効になります。両方未設定なら従来どおり公開動作です。HTTPS 配下で運用する場合は `DASHBOARD_AUTH_COOKIE_SECURE=true` を指定してください。
 
@@ -77,6 +80,10 @@ docker compose up -d --build
 
 利用者認証を有効にした場合は、先に `http://localhost:8080/user/login` でログインします。その後 `http://localhost:8080/auth/login` にアクセスして Google ログインと同意を完了します。
 
+1. カレンダーを登録
+
+`http://localhost:8080/calendars/manage` を開いて、表示対象の Google カレンダー ID を 1 件以上登録します。必要なら `【私用】` や `【仕事】` のようなプレフィックスも設定できます。
+
 1. 別ターミナルから確認
 
 ```bash
@@ -91,7 +98,7 @@ curl -X POST http://localhost:8080/messages \
   -d '{"message":"19時から配信準備です","ttl_hours":6}' | jq
 ```
 
-初回認可が終わると refresh token が `./data/google-oauth-token.json` としてホスト側に保存され、以後の再起動でも再利用されます。
+初回認可が終わると refresh token が `./data/google-oauth-token.json` としてホスト側に保存され、以後の再起動でも再利用されます。カレンダー ID の一覧は `MESSAGE_DB_PATH` の SQLite に保存されます。
 
 ## 本番サーバー設置
 
@@ -123,7 +130,6 @@ docker compose up -d --build
 Rust で直接動かす場合は、同じ環境変数をセットして起動できます。
 
 ```bash
-export GOOGLE_CALENDAR_ID=your-calendar-id@group.calendar.google.com
 export DASHBOARD_TITLE=うちまちダッシュボード
 export GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
 export GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
@@ -139,7 +145,7 @@ export PORT=8080
 cargo run
 ```
 
-ローカル実行でも、最初に `http://localhost:8080/auth/login` をブラウザで開いて認可してください。
+ローカル実行でも、最初に `http://localhost:8080/auth/login` をブラウザで開いて認可し、その後 `http://localhost:8080/calendars/manage` からカレンダーを登録してください。
 
 ## レスポンス例
 
@@ -172,6 +178,6 @@ cargo run
 - access token は refresh token から必要時に再取得します
 - 利用者認証はメモリ上のセッション Cookie で管理されるため、再起動後は再ログインが必要です
 - ダッシュボードタイトルは `DASHBOARD_TITLE` で変更できます
-- 伝言は登録時に1-24時間の有効時間を選べて、SQLite3 ファイルとしてホスト側の data 配下に保存されます
+- Google カレンダー ID と伝言は SQLite3 ファイルとしてホスト側の data 配下に保存されます
 - refresh token を再発行したい場合は `data/google-oauth-token.json` を削除して `/auth/login` をやり直してください
 - 本番向けにするならトークンキャッシュ、リトライ、メトリクス、エラーハンドリング強化を入れてください

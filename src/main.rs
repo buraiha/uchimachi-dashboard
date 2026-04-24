@@ -42,7 +42,6 @@ struct AppState {
 
 #[derive(Clone)]
 struct Config {
-    calendar_id: String,
     dashboard_title: String,
     max_results: u32,
     port: u16,
@@ -63,8 +62,6 @@ struct UserAuthConfig {
 
 impl Config {
     fn from_env() -> anyhow::Result<Self> {
-        let calendar_id =
-            env::var("GOOGLE_CALENDAR_ID").context("GOOGLE_CALENDAR_ID is required")?;
         let dashboard_title = env::var("DASHBOARD_TITLE")
             .ok()
             .map(|value| value.trim().to_string())
@@ -120,7 +117,6 @@ impl Config {
         };
 
         Ok(Self {
-            calendar_id,
             dashboard_title,
             max_results,
             port,
@@ -141,7 +137,7 @@ impl Config {
 #[derive(Serialize)]
 struct ServiceInfo {
     service: &'static str,
-    calendar_id: String,
+    calendars: Vec<String>,
     authorized: bool,
     user_auth_enabled: bool,
     endpoints: Vec<&'static str>,
@@ -181,6 +177,14 @@ struct ManageMessageForm {
     id: Option<String>,
     message: Option<String>,
     ttl_hours: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManageCalendarForm {
+    action: String,
+    current_calendar_id: Option<String>,
+    calendar_id: Option<String>,
+    title_prefix: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -251,6 +255,14 @@ struct GoogleCalendarEventDateTime {
     date: Option<String>,
     date_time: Option<String>,
     time_zone: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StoredCalendar {
+    calendar_id: String,
+    title_prefix: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -366,6 +378,10 @@ async fn main() -> anyhow::Result<()> {
     let protected_routes = Router::new()
         .route("/", get(dashboard))
         .route("/dashboard", get(dashboard))
+        .route(
+            "/calendars/manage",
+            get(calendars_manage_page).post(calendars_manage_action),
+        )
         .route("/messages", get(list_messages).post(create_message))
         .route("/messages/manage", get(messages_manage_page).post(messages_manage_action))
         .route("/auth/login", get(auth_login))
@@ -386,7 +402,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    tracing::info!(port = config.port, calendar_id = %config.calendar_id, "starting google calendar sandbox service");
+    tracing::info!(port = config.port, "starting google calendar sandbox service");
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -404,6 +420,29 @@ async fn dashboard(
     Query(query): Query<DashboardQuery>,
 ) -> Html<String> {
     let selected_max_results = resolve_dashboard_max_results(query.max_results, state.config.max_results);
+    let calendars = match load_calendars_from_db(&state.config.message_db_path).await {
+        Ok(calendars) => calendars,
+        Err(error) => {
+            return Html(render_dashboard_message(
+                &state.config.dashboard_title,
+                "カレンダー設定の読み込みに失敗しました",
+                &error.to_string(),
+                Some("/calendars/manage"),
+                Some("設定画面を開く"),
+            ));
+        }
+    };
+
+    if calendars.is_empty() {
+        return Html(render_dashboard_message(
+            &state.config.dashboard_title,
+            "Google カレンダーが未登録です",
+            "登録画面からカレンダー ID を追加してください。",
+            Some("/calendars/manage"),
+            Some("カレンダーを登録する"),
+        ));
+    }
+
     let authorized = token_file_exists(&state.config.token_store_path).await;
     if !authorized {
         return Html(render_dashboard_message(
@@ -419,7 +458,7 @@ async fn dashboard(
         Ok(access_token) => {
             match fetch_calendar_events(
                 &state.client,
-                &state.config,
+                &calendars,
                 &access_token,
                 selected_max_results,
             )
@@ -463,15 +502,24 @@ async fn dashboard(
 }
 
 async fn service_info(State(state): State<AppState>) -> Utf8Json<ServiceInfo> {
+    let calendars = load_calendars_from_db(&state.config.message_db_path)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|calendar| calendar.calendar_id)
+        .collect();
+
     Utf8Json(ServiceInfo {
         service: "uchimachi-dashboard",
-        calendar_id: state.config.calendar_id.clone(),
+        calendars,
         authorized: token_file_exists(&state.config.token_store_path).await,
         user_auth_enabled: state.config.user_auth_enabled(),
         endpoints: vec![
             "GET /",
             "GET /dashboard",
             "GET /api/info",
+            "GET /calendars/manage",
+            "POST /calendars/manage",
             "GET /messages",
             "POST /messages",
             "GET /messages/manage",
@@ -736,6 +784,54 @@ async fn messages_manage_action(
     Ok(Redirect::to("/messages/manage"))
 }
 
+async fn calendars_manage_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+    let calendars = load_calendars_from_db(&state.config.message_db_path).await?;
+    Ok(Html(render_calendar_manage_page(
+        &calendars,
+        state.config.user_auth_enabled(),
+    )))
+}
+
+async fn calendars_manage_action(
+    State(state): State<AppState>,
+    Form(payload): Form<ManageCalendarForm>,
+) -> Result<Redirect, AppError> {
+    match payload.action.as_str() {
+        "create" => {
+            let calendar_id = normalize_calendar_id_input(payload.calendar_id)?;
+            let title_prefix = normalize_calendar_prefix_input(payload.title_prefix)?;
+            insert_calendar(&state.config.message_db_path, &calendar_id, &title_prefix).await?;
+        }
+        "update" => {
+            let current_calendar_id = payload
+                .current_calendar_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::bad_request("current calendar id is required"))?;
+            let calendar_id = normalize_calendar_id_input(payload.calendar_id)?;
+            let title_prefix = normalize_calendar_prefix_input(payload.title_prefix)?;
+            update_calendar(
+                &state.config.message_db_path,
+                &current_calendar_id,
+                &calendar_id,
+                &title_prefix,
+            )
+            .await?;
+        }
+        "delete" => {
+            let current_calendar_id = payload
+                .current_calendar_id
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| AppError::bad_request("current calendar id is required"))?;
+            delete_calendar(&state.config.message_db_path, &current_calendar_id).await?;
+        }
+        _ => return Err(AppError::bad_request("unsupported calendar action")),
+    }
+
+    Ok(Redirect::to("/calendars/manage"))
+}
+
 async fn auth_login(State(state): State<AppState>) -> Result<Redirect, AppError> {
     let oauth_state = Uuid::new_v4().to_string();
     state
@@ -803,14 +899,11 @@ async fn auth_callback(
 async fn calendar_events(
     State(state): State<AppState>,
 ) -> Result<Utf8Json<GoogleCalendarEventsResponse>, AppError> {
+    let calendars = load_calendars_from_db(&state.config.message_db_path).await?;
     let access_token = get_access_token(&state.client, &state.config).await?;
-    let response = fetch_calendar_events(
-        &state.client,
-        &state.config,
-        &access_token,
-        state.config.max_results,
-    )
-    .await?;
+    let response =
+        fetch_calendar_events(&state.client, &calendars, &access_token, state.config.max_results)
+            .await?;
     Ok(Utf8Json(response))
 }
 
@@ -953,11 +1046,64 @@ async fn token_file_exists(token_store_path: &str) -> bool {
 
 async fn fetch_calendar_events(
     client: &Client,
-    config: &Config,
+    calendars: &[StoredCalendar],
     access_token: &str,
     max_results: u32,
 ) -> anyhow::Result<GoogleCalendarEventsResponse> {
-    let encoded_calendar_id = urlencoding::encode(&config.calendar_id);
+    if calendars.is_empty() {
+        return Ok(GoogleCalendarEventsResponse {
+            items: Vec::new(),
+            summary: Some("No calendars configured".to_string()),
+            time_zone: Some("Asia/Tokyo".to_string()),
+        });
+    }
+
+    let mut all_items = Vec::new();
+    let mut summary_labels = Vec::new();
+
+    for calendar in calendars {
+        let mut response = fetch_calendar_events_for_calendar_id(
+            client,
+            &calendar.calendar_id,
+            access_token,
+            max_results,
+        )
+        .await
+        .with_context(|| format!("failed to fetch calendar: {}", calendar.calendar_id))?;
+
+        for item in &mut response.items {
+            item.summary = Some(apply_calendar_prefix(
+                &calendar.title_prefix,
+                item.summary.as_deref(),
+            ));
+        }
+
+        summary_labels.push(
+            response
+                .summary
+                .clone()
+                .unwrap_or_else(|| calendar.calendar_id.clone()),
+        );
+        all_items.extend(response.items);
+    }
+
+    all_items.sort_by_key(event_sort_key);
+    all_items.truncate(max_results as usize);
+
+    Ok(GoogleCalendarEventsResponse {
+        items: all_items,
+        summary: Some(summary_labels.join(", ")),
+        time_zone: Some("Asia/Tokyo".to_string()),
+    })
+}
+
+async fn fetch_calendar_events_for_calendar_id(
+    client: &Client,
+    calendar_id: &str,
+    access_token: &str,
+    max_results: u32,
+) -> anyhow::Result<GoogleCalendarEventsResponse> {
+    let encoded_calendar_id = urlencoding::encode(calendar_id);
     let url =
         format!("https://www.googleapis.com/calendar/v3/calendars/{encoded_calendar_id}/events");
     let time_min = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -993,6 +1139,29 @@ async fn fetch_calendar_events(
     Ok(response)
 }
 
+fn event_sort_key(event: &GoogleCalendarEvent) -> i64 {
+    if let Some(value) = event
+        .start
+        .as_ref()
+        .and_then(|start| start.date_time.as_deref())
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+    {
+        return value.timestamp_millis();
+    }
+
+    if let Some(value) = event
+        .start
+        .as_ref()
+        .and_then(|start| start.date.as_deref())
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        .and_then(|value| value.and_hms_opt(0, 0, 0))
+    {
+        return value.and_utc().timestamp_millis();
+    }
+
+    i64::MAX
+}
+
 fn render_dashboard_page(
     dashboard_title: &str,
     selected_max_results: u32,
@@ -1018,6 +1187,7 @@ fn render_dashboard_page(
     } else {
         String::new()
     };
+    let calendar_actions = r#"<a href="/calendars/manage" class="hero-link-button">カレンダー設定</a>"#;
 
     let (message_group_style, message_head_margin, message_title_font_size) = if has_messages {
         ("margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid rgba(56, 42, 30, 0.1);", "12px", "18px")
@@ -1130,6 +1300,19 @@ fn render_dashboard_page(
             font: inherit;
             font-weight: 700;
             cursor: pointer;
+        }}
+        .hero-link-button {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            border-radius: 999px;
+            padding: 10px 16px;
+            background: rgba(255,255,255,0.82);
+            color: var(--ink);
+            font-weight: 700;
+            text-decoration: none;
+            white-space: nowrap;
         }}
         .hero-control-label {{
             font-size: 13px;
@@ -1380,6 +1563,7 @@ fn render_dashboard_page(
                         {max_results_options}
                     </select>
                 </form>
+                {calendar_actions}
                 {session_actions}
             </div>
         </section>
@@ -1649,6 +1833,7 @@ fn render_dashboard_page(
         message_head_margin = message_head_margin,
         message_title_font_size = message_title_font_size,
         max_results_options = max_results_options,
+        calendar_actions = calendar_actions,
         session_actions = session_actions,
         today_label = escape_html(&sections.today_label),
         tomorrow_label = escape_html(&sections.tomorrow_label),
@@ -1849,6 +2034,177 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
         create_ttl_options = create_ttl_options,
         session_actions = session_actions,
         items = items,
+    )
+}
+
+fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: bool) -> String {
+    let session_actions = if user_auth_enabled {
+        format!(
+            r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="secondary-button">ログアウト</button></form>"#,
+            logout_path = USER_LOGOUT_PATH,
+        )
+    } else {
+        String::new()
+    };
+
+    let items = if calendars.is_empty() {
+        "<div class=\"manage-empty\">登録済みの Google カレンダーはありません</div>".to_string()
+    } else {
+        calendars
+            .iter()
+            .map(|calendar| {
+                format!(
+                    r#"<article class="manage-item"><form method="post" action="/calendars/manage" class="manage-form"><input type="hidden" name="action" value="update"><input type="hidden" name="current_calendar_id" value="{current_calendar_id}"><label class="manage-label">カレンダー ID<input type="text" name="calendar_id" value="{calendar_id}" maxlength="255" required></label><label class="manage-label">予定タイトルのプレフィックス<input type="text" name="title_prefix" value="{title_prefix}" maxlength="80" placeholder="例: 【私用】"></label><div class="manage-meta">登録日時: {created_at} / 更新日時: {updated_at}</div><div class="manage-actions"><button type="submit" class="primary-button">更新する</button></div></form><form method="post" action="/calendars/manage" class="delete-form"><input type="hidden" name="action" value="delete"><input type="hidden" name="current_calendar_id" value="{current_calendar_id}"><button type="submit" class="secondary-button">削除</button></form></article>"#,
+                    current_calendar_id = escape_html(&calendar.calendar_id),
+                    calendar_id = escape_html(&calendar.calendar_id),
+                    title_prefix = escape_html(&calendar.title_prefix),
+                    created_at = escape_html(&format_registered_at(calendar.created_at.with_timezone(&chrono_tz::Asia::Tokyo))),
+                    updated_at = escape_html(&format_registered_at(calendar.updated_at.with_timezone(&chrono_tz::Asia::Tokyo))),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>カレンダー設定</title>
+    <style>
+        :root {{
+            --bg: #f7f1e3;
+            --panel: rgba(255, 252, 245, 0.92);
+            --line: rgba(56, 42, 30, 0.14);
+            --ink: #2f241b;
+            --muted: #7a6757;
+            --accent: #c55c3b;
+            --accent-soft: #efdbc8;
+            --shadow: 0 24px 70px rgba(77, 54, 33, 0.14);
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            padding: 24px;
+            font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at top left, rgba(255, 214, 167, 0.9), transparent 28%),
+                radial-gradient(circle at bottom right, rgba(205, 116, 82, 0.24), transparent 24%),
+                linear-gradient(135deg, #fbf4e6 0%, #f4eadf 45%, #efe4d7 100%);
+        }}
+        main {{ max-width: 980px; margin: 0 auto; display: grid; gap: 20px; }}
+        .panel {{
+            border: 1px solid var(--line);
+            border-radius: 28px;
+            background: var(--panel);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }}
+        .panel-head {{ padding: 24px 26px 18px; border-bottom: 1px solid var(--line); }}
+        .panel-body {{ padding: 22px 24px 24px; }}
+        .eyebrow {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--accent);
+            background: var(--accent-soft);
+        }}
+        .title {{ margin: 12px 0 8px; font-size: 30px; line-height: 1.1; }}
+        .subtitle {{ margin: 0; color: var(--muted); line-height: 1.6; }}
+        .toolbar {{ display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }}
+        .manage-list {{ display: grid; gap: 16px; }}
+        .manage-item {{
+            display: grid;
+            gap: 12px;
+            padding: 18px;
+            border-radius: 20px;
+            border: 1px solid rgba(56, 42, 30, 0.1);
+            background: rgba(255,255,255,0.54);
+        }}
+        .manage-form {{ display: grid; gap: 12px; }}
+        .manage-label {{ display: grid; gap: 8px; font-weight: 700; }}
+        input[type="text"] {{
+            width: 100%;
+            padding: 12px 14px;
+            border-radius: 16px;
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            background: rgba(255,255,255,0.88);
+            font: inherit;
+            color: inherit;
+        }}
+        .manage-actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .manage-meta {{ font-size: 13px; color: var(--muted); }}
+        .primary-button, .secondary-button, .link-button {{
+            appearance: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 12px 18px;
+            border-radius: 999px;
+            font: inherit;
+            font-weight: 700;
+            text-decoration: none;
+            cursor: pointer;
+        }}
+        .primary-button {{ border: none; background: var(--accent); color: #fff; }}
+        .secondary-button, .link-button {{
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            background: rgba(255,255,255,0.82);
+            color: var(--ink);
+        }}
+        .manage-empty {{
+            padding: 18px;
+            border-radius: 18px;
+            border: 1px dashed rgba(101, 76, 53, 0.2);
+            color: var(--muted);
+            background: rgba(255,255,255,0.25);
+            text-align: center;
+        }}
+    </style>
+</head>
+<body>
+    <main>
+        <section class="panel">
+            <div class="panel-head">
+                <span class="eyebrow">Calendar</span>
+                <h1 class="title">Google カレンダー設定</h1>
+                <p class="subtitle">表示対象の Google カレンダー ID を複数登録できます。更新すると次回リロードから反映されます。</p>
+                <div class="toolbar">
+                    <a class="link-button" href="/dashboard">ダッシュボードに戻る</a>
+                    <a class="link-button" href="/messages/manage">伝言の編集へ</a>
+                    {session_actions}
+                </div>
+            </div>
+            <div class="panel-body">
+                <form method="post" action="/calendars/manage" class="manage-form" style="margin-bottom:20px;">
+                    <input type="hidden" name="action" value="create">
+                    <label class="manage-label">新しいカレンダー ID
+                        <input type="text" name="calendar_id" maxlength="255" placeholder="example@group.calendar.google.com" required>
+                    </label>
+                    <label class="manage-label">予定タイトルのプレフィックス
+                        <input type="text" name="title_prefix" maxlength="80" placeholder="例: 【私用】">
+                    </label>
+                    <div class="manage-actions">
+                        <button type="submit" class="primary-button">追加する</button>
+                    </div>
+                </form>
+                <div class="manage-list">{items}</div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>"#,
+        items = items,
+        session_actions = session_actions,
     )
 }
 
@@ -2358,7 +2714,10 @@ fn clear_user_session_cookie() -> String {
 }
 
 fn is_browser_route(path: &str) -> bool {
-    matches!(path, "/" | "/dashboard" | "/messages/manage" | "/auth/login")
+    matches!(
+        path,
+        "/" | "/dashboard" | "/messages/manage" | "/calendars/manage" | "/auth/login"
+    )
 }
 
 fn sanitize_next_path(candidate: Option<&str>) -> String {
@@ -2480,6 +2839,50 @@ fn parse_message_ttl_hours_form_value(ttl_hours: Option<String>) -> Result<i64, 
     resolve_message_ttl_hours(parsed)
 }
 
+fn normalize_calendar_id_input(calendar_id: Option<String>) -> Result<String, AppError> {
+    let calendar_id = calendar_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::bad_request("calendar_id must not be empty"))?;
+
+    if calendar_id.chars().count() > 255 {
+        return Err(AppError::bad_request(
+            "calendar_id must be 255 characters or fewer",
+        ));
+    }
+
+    Ok(calendar_id)
+}
+
+fn normalize_calendar_prefix_input(title_prefix: Option<String>) -> Result<String, AppError> {
+    let title_prefix = title_prefix
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if title_prefix.chars().count() > 80 {
+        return Err(AppError::bad_request(
+            "title_prefix must be 80 characters or fewer",
+        ));
+    }
+
+    Ok(title_prefix)
+}
+
+fn apply_calendar_prefix(title_prefix: &str, summary: Option<&str>) -> String {
+    let base_title = summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("タイトル未設定");
+
+    let title_prefix = title_prefix.trim();
+    if title_prefix.is_empty() {
+        base_title.to_string()
+    } else {
+        format!("{} {}", title_prefix, base_title)
+    }
+}
+
 async fn load_active_messages(state: &AppState) -> anyhow::Result<Vec<StoredMessage>> {
     load_active_messages_from_db(&state.config.message_db_path).await
 }
@@ -2499,8 +2902,15 @@ async fn init_message_db(message_db_path: &str) -> anyhow::Result<()> {
                 session_id TEXT PRIMARY KEY,
                 created_at_ms INTEGER NOT NULL,
                 expires_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS calendars (
+                calendar_id TEXT PRIMARY KEY,
+                title_prefix TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
             );",
         )?;
+        ensure_calendar_prefix_column(&connection)?;
         Ok(())
     })
     .await
@@ -2620,6 +3030,110 @@ async fn load_active_messages_from_db(message_db_path: &str) -> anyhow::Result<V
     .context("failed to join message load task")?
 }
 
+async fn load_calendars_from_db(message_db_path: &str) -> anyhow::Result<Vec<StoredCalendar>> {
+    let db_path = message_db_path.to_string();
+    task::spawn_blocking(move || -> anyhow::Result<Vec<StoredCalendar>> {
+        let connection = open_message_db(&db_path)?;
+        ensure_calendar_prefix_column(&connection)?;
+        let mut statement = connection.prepare(
+            "SELECT calendar_id, title_prefix, created_at_ms, updated_at_ms
+             FROM calendars
+             ORDER BY updated_at_ms DESC, calendar_id ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut calendars = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            calendars.push(StoredCalendar {
+                calendar_id: row.get(0)?,
+                title_prefix: row.get(1)?,
+                created_at: millis_to_utc(row.get::<_, i64>(2)?)?,
+                updated_at: millis_to_utc(row.get::<_, i64>(3)?)?,
+            });
+        }
+
+        Ok(calendars)
+    })
+    .await
+    .context("failed to join calendar load task")?
+}
+
+async fn insert_calendar(
+    message_db_path: &str,
+    calendar_id: &str,
+    title_prefix: &str,
+) -> anyhow::Result<()> {
+    let db_path = message_db_path.to_string();
+    let calendar_id = calendar_id.to_string();
+    let title_prefix = title_prefix.to_string();
+    task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = open_message_db(&db_path)?;
+        ensure_calendar_prefix_column(&connection)?;
+        let now_ms = Utc::now().timestamp_millis();
+        connection.execute(
+            "INSERT INTO calendars (calendar_id, title_prefix, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![calendar_id, title_prefix, now_ms, now_ms],
+        )?;
+        Ok(())
+    })
+    .await
+    .context("failed to join calendar insert task")??;
+
+    Ok(())
+}
+
+async fn update_calendar(
+    message_db_path: &str,
+    current_calendar_id: &str,
+    new_calendar_id: &str,
+    title_prefix: &str,
+) -> anyhow::Result<()> {
+    let db_path = message_db_path.to_string();
+    let current_calendar_id = current_calendar_id.to_string();
+    let new_calendar_id = new_calendar_id.to_string();
+    let title_prefix = title_prefix.to_string();
+    task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = open_message_db(&db_path)?;
+        ensure_calendar_prefix_column(&connection)?;
+        let updated_rows = connection.execute(
+            "UPDATE calendars SET calendar_id = ?1, title_prefix = ?2, updated_at_ms = ?3 WHERE calendar_id = ?4",
+            params![new_calendar_id, title_prefix, Utc::now().timestamp_millis(), current_calendar_id],
+        )?;
+
+        if updated_rows == 0 {
+            return Err(anyhow!("calendar not found: {}", current_calendar_id));
+        }
+
+        Ok(())
+    })
+    .await
+    .context("failed to join calendar update task")??;
+
+    Ok(())
+}
+
+async fn delete_calendar(message_db_path: &str, calendar_id: &str) -> anyhow::Result<()> {
+    let db_path = message_db_path.to_string();
+    let calendar_id = calendar_id.to_string();
+    task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = open_message_db(&db_path)?;
+        let deleted_rows = connection.execute(
+            "DELETE FROM calendars WHERE calendar_id = ?1",
+            params![calendar_id],
+        )?;
+
+        if deleted_rows == 0 {
+            return Err(anyhow!("calendar not found: {}", calendar_id));
+        }
+
+        Ok(())
+    })
+    .await
+    .context("failed to join calendar delete task")??;
+
+    Ok(())
+}
+
 fn open_message_db(message_db_path: &str) -> anyhow::Result<Connection> {
     if let Some(parent) = Path::new(message_db_path).parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -2629,6 +3143,29 @@ fn open_message_db(message_db_path: &str) -> anyhow::Result<Connection> {
 
     Connection::open(message_db_path)
         .with_context(|| format!("failed to open sqlite database: {message_db_path}"))
+}
+
+fn ensure_calendar_prefix_column(connection: &Connection) -> anyhow::Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(calendars)")?;
+    let mut rows = statement.query([])?;
+    let mut has_title_prefix = false;
+
+    while let Some(row) = rows.next()? {
+        let column_name: String = row.get(1)?;
+        if column_name == "title_prefix" {
+            has_title_prefix = true;
+            break;
+        }
+    }
+
+    if !has_title_prefix {
+        connection.execute(
+            "ALTER TABLE calendars ADD COLUMN title_prefix TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    Ok(())
 }
 
 fn prune_expired_messages_in_db(connection: &Connection, now_ms: i64) -> anyhow::Result<()> {
