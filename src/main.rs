@@ -1277,6 +1277,12 @@ fn render_dashboard_page(
             justify-content: space-between;
             gap: 14px;
         }}
+        .section-head-inline {{
+            display: flex;
+            align-items: flex-start;
+            justify-content: flex-start;
+            gap: 14px;
+        }}
         .head-copy {{
             display: grid;
             gap: 8px;
@@ -1475,6 +1481,7 @@ fn render_dashboard_page(
             .schedule-body {{ padding: 10px 14px 14px; }}
             .schedule-body {{ overflow: auto; }}
             .head-inline {{ gap: 10px; }}
+            .section-head-inline {{ gap: 10px; }}
             .head-copy {{ gap: 6px; }}
             .hero-controls {{ gap: 8px; }}
             .hero-control-label {{ font-size: 12px; }}
@@ -1570,7 +1577,7 @@ fn render_dashboard_page(
         <section class="content">
             <section class="panel">
                 <div class="panel-head">
-                    <div class="head-inline">
+                    <div class="section-head-inline">
                         <span class="eyebrow">Today</span>
                         <div class="head-copy">
                             <h2 class="section-title">今日の予定</h2>
@@ -1595,7 +1602,7 @@ fn render_dashboard_page(
             </section>
             <section class="panel">
                 <div class="panel-head">
-                    <div class="head-inline">
+                    <div class="section-head-inline">
                         <span class="eyebrow">Tomorrow</span>
                         <div class="head-copy">
                             <h2 class="section-title">明日の予定</h2>
@@ -1609,7 +1616,7 @@ fn render_dashboard_page(
             </section>
             <aside class="panel column-upcoming">
                 <div class="panel-head">
-                    <div class="head-inline">
+                    <div class="section-head-inline">
                         <span class="eyebrow">Upcoming</span>
                         <div class="head-copy">
                             <h2 class="section-title">明後日以降の予定</h2>
