@@ -7,7 +7,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
-use chrono::{DateTime, Datelike, Duration, NaiveDate, SecondsFormat, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use reqwest::Client;
 use rusqlite::{Connection, params};
@@ -25,9 +25,7 @@ const DASHBOARD_RELOAD_SECONDS: i64 = 600;
 const DEFAULT_DASHBOARD_MAX_RESULTS: u32 = 10;
 const DASHBOARD_MAX_RESULTS_STEP: u32 = 10;
 const DASHBOARD_MAX_RESULTS_LIMIT: u32 = 40;
-const DEFAULT_MESSAGE_TTL_HOURS: i64 = 12;
-const MIN_MESSAGE_TTL_HOURS: i64 = 1;
-const MAX_MESSAGE_TTL_HOURS: i64 = 24;
+const MESSAGE_TIMEZONE: Tz = chrono_tz::Asia::Tokyo;
 const USER_LOGIN_PATH: &str = "/user/login";
 const USER_LOGOUT_PATH: &str = "/user/logout";
 const USER_SESSION_COOKIE_NAME: &str = "uchimachi_dashboard_session";
@@ -160,15 +158,13 @@ struct AuthStatusResponse {
 #[derive(Serialize)]
 struct MessageApiResponse {
     active_messages: Vec<StoredMessage>,
-    ttl_hours: i64,
-    min_ttl_hours: i64,
-    max_ttl_hours: i64,
+    time_zone: &'static str,
 }
 
 #[derive(Deserialize)]
 struct CreateMessageRequest {
     message: String,
-    ttl_hours: Option<i64>,
+    expires_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -176,7 +172,7 @@ struct ManageMessageForm {
     action: String,
     id: Option<String>,
     message: Option<String>,
-    ttl_hours: Option<String>,
+    expires_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -682,9 +678,7 @@ async fn list_messages(
     let active_messages = load_active_messages(&state).await?;
     Ok(Utf8Json(MessageApiResponse {
         active_messages,
-        ttl_hours: DEFAULT_MESSAGE_TTL_HOURS,
-        min_ttl_hours: MIN_MESSAGE_TTL_HOURS,
-        max_ttl_hours: MAX_MESSAGE_TTL_HOURS,
+        time_zone: "Asia/Tokyo",
     }))
 }
 
@@ -693,7 +687,6 @@ async fn create_message(
     Json(payload): Json<CreateMessageRequest>,
 ) -> Result<(StatusCode, Utf8Json<StoredMessage>), AppError> {
     let message = payload.message.trim();
-    let ttl_hours = resolve_message_ttl_hours(payload.ttl_hours)?;
     if message.is_empty() {
         return Err(AppError::bad_request("message must not be empty"));
     }
@@ -704,12 +697,13 @@ async fn create_message(
     }
 
     let now = Utc::now();
+    let expires_at = parse_message_expires_at_input(payload.expires_at.as_deref(), now)?;
 
     let new_message = StoredMessage {
         id: Uuid::new_v4().to_string(),
         message: message.to_string(),
         created_at: now,
-        expires_at: now + Duration::hours(ttl_hours),
+        expires_at,
     };
 
     insert_message(&state.config.message_db_path, &new_message).await?;
@@ -732,7 +726,6 @@ async fn messages_manage_action(
     match payload.action.as_str() {
         "create" => {
             let message = payload.message.unwrap_or_default();
-            let ttl_hours = parse_message_ttl_hours_form_value(payload.ttl_hours.clone())?;
             let trimmed = message.trim();
             if trimmed.is_empty() {
                 return Err(AppError::bad_request("message must not be empty"));
@@ -744,11 +737,12 @@ async fn messages_manage_action(
             }
 
             let now = Utc::now();
+            let expires_at = parse_message_expires_at_input(payload.expires_at.as_deref(), now)?;
             let new_message = StoredMessage {
                 id: Uuid::new_v4().to_string(),
                 message: trimmed.to_string(),
                 created_at: now,
-                expires_at: now + Duration::hours(ttl_hours),
+                expires_at,
             };
             insert_message(&state.config.message_db_path, &new_message).await?;
         }
@@ -768,8 +762,8 @@ async fn messages_manage_action(
                 ));
             }
 
-            let ttl_hours = parse_message_ttl_hours_form_value(payload.ttl_hours.clone())?;
-            update_message(&state.config.message_db_path, &id, trimmed, ttl_hours).await?;
+            let expires_at = parse_message_expires_at_input(payload.expires_at.as_deref(), Utc::now())?;
+            update_message(&state.config.message_db_path, &id, trimmed, expires_at).await?;
         }
         "delete" => {
             let id = payload
@@ -1851,7 +1845,7 @@ fn render_dashboard_page(
 }
 
 fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: bool) -> String {
-    let create_ttl_options = render_ttl_option_tags(DEFAULT_MESSAGE_TTL_HOURS);
+    let min_expires_at = current_message_min_datetime_value();
     let session_actions = if user_auth_enabled {
         format!(
             r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="secondary-button">ログアウト</button></form>"#,
@@ -1860,23 +1854,25 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
     } else {
         String::new()
     };
+
     let items = if messages.is_empty() {
         "<div class=\"manage-empty\">現在有効な伝言はありません</div>".to_string()
     } else {
         messages
             .iter()
             .map(|message| {
-                let ttl_options = render_ttl_option_tags(message_ttl_hours(message));
+                let expires_at_value = format_message_datetime_local_value(message.expires_at);
                 format!(
-                    r#"<article class="manage-item"><form method="post" action="/messages/manage" class="manage-form"><input type="hidden" name="id" value="{id}"><input type="hidden" name="action" value="update"><label class="manage-label">伝言<textarea name="message" maxlength="280" required>{message}</textarea></label><label class="manage-label">有効時間<select name="ttl_hours" required>{ttl_options}</select></label><div class="manage-meta">登録日時: {registered_at} / 失効日時: {expires_at}</div><div class="manage-actions"><button type="submit" class="primary-button">更新する</button></div></form><form method="post" action="/messages/manage" class="delete-form"><input type="hidden" name="id" value="{id}"><input type="hidden" name="action" value="delete"><button type="submit" class="secondary-button">削除</button></form></article>"#,
+                    r#"<article class="manage-item"><form method="post" action="/messages/manage" class="manage-form"><input type="hidden" name="id" value="{id}"><input type="hidden" name="action" value="update"><label class="manage-label">伝言<textarea name="message" maxlength="280" required>{message}</textarea></label><label class="manage-label">表示期限<input type="datetime-local" name="expires_at" value="{expires_at_value}" min="{min_expires_at}" required></label><div class="manage-meta">登録日時: {registered_at} / 表示期限: {expires_at}</div><div class="manage-actions"><button type="submit" class="primary-button">更新する</button></div></form><form method="post" action="/messages/manage" class="delete-form"><input type="hidden" name="id" value="{id}"><input type="hidden" name="action" value="delete"><button type="submit" class="secondary-button">削除</button></form></article>"#,
                     id = escape_html(&message.id),
                     message = escape_html(&message.message),
-                    ttl_options = ttl_options,
+                    expires_at_value = escape_html(&expires_at_value),
+                    min_expires_at = escape_html(&min_expires_at),
                     registered_at = escape_html(&format_registered_at(
-                        message.created_at.with_timezone(&chrono_tz::Asia::Tokyo)
+                        message.created_at.with_timezone(&MESSAGE_TIMEZONE)
                     )),
                     expires_at = escape_html(&format_registered_at(
-                        message.expires_at.with_timezone(&chrono_tz::Asia::Tokyo)
+                        message.expires_at.with_timezone(&MESSAGE_TIMEZONE)
                     )),
                 )
             })
@@ -1949,7 +1945,7 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
         }}
         .manage-form {{ display: grid; gap: 12px; }}
         .manage-label {{ display: grid; gap: 8px; font-weight: 700; }}
-        select {{
+        input[type="datetime-local"] {{
             width: 100%;
             padding: 12px 14px;
             border-radius: 16px;
@@ -2003,7 +1999,7 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
             <div class="panel-head">
                 <span class="eyebrow">Message</span>
                 <h1 class="title">伝言の編集</h1>
-                <p class="subtitle">追加・更新・削除ができます。伝言ごとに1-24時間の有効時間を選べて、更新時は現在時刻から再計算します。</p>
+                <p class="subtitle">追加・更新・削除ができます。表示期限を「何日何時何分まで」で指定できます。過去日時は入力できません。</p>
                 <div class="toolbar">
                     <a class="link-button" href="/dashboard">ダッシュボードに戻る</a>
                     {session_actions}
@@ -2016,8 +2012,8 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
                         <label class="manage-label">新しい伝言
                             <textarea name="message" maxlength="280" placeholder="伝言を入力してください" required></textarea>
                         </label>
-                        <label class="manage-label">有効時間
-                            <select name="ttl_hours" required>{create_ttl_options}</select>
+                        <label class="manage-label">表示期限
+                            <input type="datetime-local" name="expires_at" min="{min_expires_at}" required>
                         </label>
                         <div class="manage-actions">
                             <button type="submit" class="primary-button">追加する</button>
@@ -2038,7 +2034,7 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
     </main>
 </body>
 </html>"#,
-        create_ttl_options = create_ttl_options,
+        min_expires_at = min_expires_at,
         session_actions = session_actions,
         items = items,
     )
@@ -2349,21 +2345,6 @@ fn render_user_login_page(
         login_path = USER_LOGIN_PATH,
         next_path = escape_html(next_path),
     )
-}
-
-fn render_ttl_option_tags(selected_hours: i64) -> String {
-    (MIN_MESSAGE_TTL_HOURS..=MAX_MESSAGE_TTL_HOURS)
-        .map(|hours| {
-            let selected = if hours == selected_hours { " selected" } else { "" };
-            format!(r#"<option value="{hours}"{selected}>{hours}時間</option>"#)
-        })
-        .collect::<Vec<_>>()
-        .join("")
-}
-
-fn message_ttl_hours(message: &StoredMessage) -> i64 {
-    let ttl_hours = (message.expires_at - message.created_at).num_hours();
-    ttl_hours.clamp(MIN_MESSAGE_TTL_HOURS, MAX_MESSAGE_TTL_HOURS)
 }
 
 fn render_dashboard_message(
@@ -2816,34 +2797,49 @@ fn render_dashboard_max_results_options(selected_value: u32) -> String {
         .join("")
 }
 
-fn resolve_message_ttl_hours(ttl_hours: Option<i64>) -> Result<i64, AppError> {
-    let ttl_hours = ttl_hours.unwrap_or(DEFAULT_MESSAGE_TTL_HOURS);
-    if !(MIN_MESSAGE_TTL_HOURS..=MAX_MESSAGE_TTL_HOURS).contains(&ttl_hours) {
-        return Err(AppError::bad_request(format!(
-            "ttl_hours must be between {} and {}",
-            MIN_MESSAGE_TTL_HOURS, MAX_MESSAGE_TTL_HOURS
-        )));
-    }
-
-    Ok(ttl_hours)
+fn current_message_min_datetime_value() -> String {
+    format_message_datetime_local_value(Utc::now())
 }
 
-fn parse_message_ttl_hours_form_value(ttl_hours: Option<String>) -> Result<i64, AppError> {
-    let parsed = ttl_hours
-        .as_deref()
+fn format_message_datetime_local_value(value: DateTime<Utc>) -> String {
+    value
+        .with_timezone(&MESSAGE_TIMEZONE)
+        .format("%Y-%m-%dT%H:%M")
+        .to_string()
+}
+
+fn parse_message_expires_at_input(
+    value: Option<&str>,
+    now_utc: DateTime<Utc>,
+) -> Result<DateTime<Utc>, AppError> {
+    let value = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| {
-            value.parse::<i64>().map_err(|_| {
-                AppError::bad_request(format!(
-                    "ttl_hours must be between {} and {}",
-                    MIN_MESSAGE_TTL_HOURS, MAX_MESSAGE_TTL_HOURS
-                ))
-            })
-        })
-        .transpose()?;
+        .ok_or_else(|| AppError::bad_request("expires_at is required"))?;
 
-    resolve_message_ttl_hours(parsed)
+    let expires_at = parse_message_expires_at_value(value)?;
+    if expires_at < now_utc {
+        return Err(AppError::bad_request(
+            "expires_at must be in the future",
+        ));
+    }
+
+    Ok(expires_at)
+}
+
+fn parse_message_expires_at_value(value: &str) -> Result<DateTime<Utc>, AppError> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Ok(parsed.with_timezone(&Utc));
+    }
+
+    let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
+        .map_err(|_| AppError::bad_request("expires_at must be a valid datetime"))?;
+
+    MESSAGE_TIMEZONE
+        .from_local_datetime(&naive)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| AppError::bad_request("expires_at must be a valid datetime"))
 }
 
 fn normalize_calendar_id_input(calendar_id: Option<String>) -> Result<String, AppError> {
@@ -2953,7 +2949,7 @@ async fn update_message(
     message_db_path: &str,
     id: &str,
     message: &str,
-    ttl_hours: i64,
+    expires_at: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let db_path = message_db_path.to_string();
     let message_id = id.to_string();
@@ -2967,7 +2963,7 @@ async fn update_message(
             params![
                 updated_message,
                 now.timestamp_millis(),
-                (now + Duration::hours(ttl_hours)).timestamp_millis(),
+                expires_at.timestamp_millis(),
                 message_id,
             ],
         )?;
