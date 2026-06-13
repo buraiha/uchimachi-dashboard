@@ -1,6 +1,6 @@
 # うちまちダッシュボード
 
-Google Calendar API から複数のカレンダーの今後のイベントを取得する Rust 製のダッシュボードです。Docker Compose で HTTP サービスとして起動し、OAuth 2.0 のユーザー認可で Google にログインして利用します。
+Google Calendar API から複数のカレンダーの今後のイベントを取得する Rust 製のダッシュボードです。Podman Compose または Docker Compose で HTTP サービスとして起動し、OAuth 2.0 のユーザー認可で Google にログインして利用します。
 
 ## できること
 
@@ -20,7 +20,7 @@ Google Calendar API から複数のカレンダーの今後のイベントを取
 
 ## 前提
 
-- Docker と Docker Compose が使えること
+- Podman と Podman Compose、または Docker と Docker Compose が使えること
 - Google Cloud で Calendar API を有効化していること
 - Google Cloud で OAuth 同意画面を設定できること
 - OAuth 2.0 Client ID を発行できること
@@ -52,6 +52,8 @@ mkdir -p data
 
 ```dotenv
 DASHBOARD_TITLE=うちまちダッシュボード
+APP_UID=1000
+APP_GID=1000
 GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
 GOOGLE_OAUTH_CLIENT_SECRET=your-google-oauth-client-secret
 GOOGLE_OAUTH_REDIRECT_URL=https://your-domain.com/auth/callback
@@ -66,15 +68,20 @@ PORT=8080
 
 カレンダー ID は `.env` ではなく、起動後にダッシュボードの `カレンダー設定` から登録します。登録内容は `MESSAGE_DB_PATH` の SQLite に保存されます。
 
+`APP_UID` と `APP_GID` は、コンテナからホスト側の `./data` に SQLite や token を保存するための実行ユーザーです。通常は `id -u` と `id -g` の値に合わせます。
+Rootless Podman では `userns_mode: keep-id` により、ホスト側の UID/GID をコンテナ内でも同じ値として扱います。
+
 `DASHBOARD_AUTH_USERNAME` と `DASHBOARD_AUTH_PASSWORD` を両方設定すると、ダッシュボード利用者向けのログインが有効になります。両方未設定なら従来どおり公開動作です。HTTPS 配下で運用する場合は `DASHBOARD_AUTH_COOKIE_SECURE=true` を指定してください。
 
 1. サービスを起動
 
 ```bash
-docker compose up -d --build
+podman compose up -d --build
 ```
 
-`docker-compose.yml` では `restart: unless-stopped` を指定しているため、Docker デーモン再起動やサーバー再起動後も自動復帰します。`docker compose stop` で明示的に停止した場合は、その停止状態が維持されます。
+Docker Compose を使う場合は `docker compose up -d --build` でも起動できます。
+
+`docker-compose.yml` では `restart: unless-stopped` を指定しているため、コンテナランタイムやサーバーの再起動後も自動復帰します。`podman compose stop` または `docker compose stop` で明示的に停止した場合は、その停止状態が維持されます。
 
 1. ブラウザで認可を実行
 
@@ -107,14 +114,14 @@ curl -X POST http://localhost:8080/messages \
 1. リポジトリを clone する
 2. `.env` を用意する
 3. `data` ディレクトリを作る
-4. `docker compose up -d --build` を実行する
+4. `podman compose up -d --build` を実行する
 
 ```bash
 git clone https://github.com/buraiha/uchimachi-dashboard.git
 cd uchimachi-dashboard
 cp .env.example .env
 mkdir -p data
-docker compose up -d --build
+podman compose up -d --build
 ```
 
 注意点:
