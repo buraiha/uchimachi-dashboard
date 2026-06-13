@@ -13,6 +13,7 @@ Google Calendar API から複数のカレンダーの今後のイベントを取
 - `GET /` と `GET /dashboard` で表示用ダッシュボード
 - `GET /calendars/manage` と `POST /calendars/manage` で表示対象カレンダーを登録・更新・削除
   予定タイトル用のプレフィックスも任意で設定可能
+- `GET /events/manage` と `POST /events/manage` で予定ごとのメモ・URLを登録・更新・削除
 - `GET /messages` で有効な伝言一覧を取得
 - `POST /messages` で1-24時間有効な伝言を登録
 - `GET /calendar` で対象カレンダーの今後のイベントを取得
@@ -66,7 +67,7 @@ GOOGLE_MAX_RESULTS=10
 PORT=8080
 ```
 
-カレンダー ID は `.env` ではなく、起動後にダッシュボードの `カレンダー設定` から登録します。登録内容は `MESSAGE_DB_PATH` の SQLite に保存されます。
+カレンダー ID は `.env` ではなく、起動後にダッシュボードの `カレンダー設定` から登録します。登録内容は `MESSAGE_DB_PATH` の SQLite に保存されます。予定ごとのメモ・URLは `予定メモ設定` から登録でき、メモは予定タイトルの下に小さく表示され、URL を登録した場合は `【リンク】` として表示されます。
 
 `APP_UID` と `APP_GID` は、コンテナからホスト側の `./data` に SQLite や token を保存するための実行ユーザーです。通常は `id -u` と `id -g` の値に合わせます。
 Rootless Podman では `userns_mode: keep-id` により、ホスト側の UID/GID をコンテナ内でも同じ値として扱います。
@@ -90,6 +91,10 @@ Docker Compose を使う場合は `docker compose up -d --build` でも起動で
 1. カレンダーを登録
 
 `http://localhost:8080/calendars/manage` を開いて、表示対象の Google カレンダー ID を 1 件以上登録します。必要なら `【私用】` や `【仕事】` のようなプレフィックスも設定できます。
+
+1. 予定ごとのメモ・URLを登録
+
+`http://localhost:8080/events/manage` を開いて、取得済みの予定ごとにメモと関連ページの URL を設定できます。どちらも空欄にして保存すると、その予定の設定は削除されます。
 
 1. 別ターミナルから確認
 

@@ -7,12 +7,20 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
 };
-use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
+};
 use chrono_tz::Tz;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, env, net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+};
 use tokio::{fs, sync::Mutex, task};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
@@ -183,9 +191,23 @@ struct ManageCalendarForm {
     title_prefix: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ManageEventAnnotationForm {
+    calendar_id: String,
+    event_id: String,
+    memo: Option<String>,
+    url: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct DashboardQuery {
     max_results: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct EventManageQuery {
+    calendar_id: Option<String>,
+    event_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +265,12 @@ struct GoogleCalendarEvent {
     html_link: Option<String>,
     start: Option<GoogleCalendarEventDateTime>,
     end: Option<GoogleCalendarEventDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_calendar_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_memo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event_url: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -261,6 +289,14 @@ struct StoredCalendar {
     updated_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug)]
+struct EventAnnotation {
+    calendar_id: String,
+    event_id: String,
+    memo: String,
+    url: String,
+}
+
 #[derive(Debug)]
 struct AppError {
     status: StatusCode,
@@ -271,6 +307,10 @@ struct DashboardEvent {
     time_label: String,
     date_label: Option<String>,
     title: String,
+    calendar_id: Option<String>,
+    event_id: Option<String>,
+    memo: Option<String>,
+    url: Option<String>,
     sort_key: i64,
 }
 
@@ -378,8 +418,15 @@ async fn main() -> anyhow::Result<()> {
             "/calendars/manage",
             get(calendars_manage_page).post(calendars_manage_action),
         )
+        .route(
+            "/events/manage",
+            get(events_manage_page).post(events_manage_action),
+        )
         .route("/messages", get(list_messages).post(create_message))
-        .route("/messages/manage", get(messages_manage_page).post(messages_manage_action))
+        .route(
+            "/messages/manage",
+            get(messages_manage_page).post(messages_manage_action),
+        )
         .route("/auth/login", get(auth_login))
         .route("/auth/status", get(auth_status))
         .route("/calendar", get(calendar_events))
@@ -393,12 +440,18 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/info", get(service_info))
         .route("/health", get(health))
         .route("/auth/callback", get(auth_callback))
-        .route(USER_LOGIN_PATH, get(user_login_page).post(user_login_submit))
+        .route(
+            USER_LOGIN_PATH,
+            get(user_login_page).post(user_login_submit),
+        )
         .route(USER_LOGOUT_PATH, get(user_logout).post(user_logout))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
-    tracing::info!(port = config.port, "starting google calendar sandbox service");
+    tracing::info!(
+        port = config.port,
+        "starting google calendar sandbox service"
+    );
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -415,7 +468,8 @@ async fn dashboard(
     State(state): State<AppState>,
     Query(query): Query<DashboardQuery>,
 ) -> Html<String> {
-    let selected_max_results = resolve_dashboard_max_results(query.max_results, state.config.max_results);
+    let selected_max_results =
+        resolve_dashboard_max_results(query.max_results, state.config.max_results);
     let calendars = match load_calendars_from_db(&state.config.message_db_path).await {
         Ok(calendars) => calendars,
         Err(error) => {
@@ -452,11 +506,25 @@ async fn dashboard(
 
     let content = match get_access_token(&state.client, &state.config).await {
         Ok(access_token) => {
+            let annotations =
+                match load_event_annotations_from_db(&state.config.message_db_path).await {
+                    Ok(annotations) => annotations,
+                    Err(error) => {
+                        return Html(render_dashboard_message(
+                            &state.config.dashboard_title,
+                            "予定メモの読み込みに失敗しました",
+                            &error.to_string(),
+                            None,
+                            None,
+                        ));
+                    }
+                };
             match fetch_calendar_events(
                 &state.client,
                 &calendars,
                 &access_token,
                 selected_max_results,
+                &annotations,
             )
             .await
             {
@@ -516,6 +584,8 @@ async fn service_info(State(state): State<AppState>) -> Utf8Json<ServiceInfo> {
             "GET /api/info",
             "GET /calendars/manage",
             "POST /calendars/manage",
+            "GET /events/manage",
+            "POST /events/manage",
             "GET /messages",
             "POST /messages",
             "GET /messages/manage",
@@ -595,7 +665,7 @@ async fn user_login_submit(
     }
 
     let session_id = Uuid::new_v4().to_string();
-    
+
     // データベースにセッションを保存
     if let Err(e) = save_session_to_db(&state.config.message_db_path, &session_id).await {
         tracing::error!("Failed to save session to db: {}", e);
@@ -603,14 +673,17 @@ async fn user_login_submit(
             StatusCode::INTERNAL_SERVER_ERROR,
             Html("セッション保存に失敗しました"),
         )
-        .into_response();
+            .into_response();
     }
 
     // メモリ内にも保持（後方互換性のため）
     state.user_sessions.lock().await.insert(session_id.clone());
 
     (
-        [(header::SET_COOKIE, build_user_session_cookie(&state.config, &session_id))],
+        [(
+            header::SET_COOKIE,
+            build_user_session_cookie(&state.config, &session_id),
+        )],
         Redirect::to(&next_path),
     )
         .into_response()
@@ -620,7 +693,7 @@ async fn user_logout(State(state): State<AppState>, headers: HeaderMap) -> Respo
     if let Some(session_id) = extract_cookie_value(&headers, USER_SESSION_COOKIE_NAME) {
         // メモリから削除
         state.user_sessions.lock().await.remove(&session_id);
-        
+
         // データベースからも削除
         if let Err(e) = remove_session_from_db(&state.config.message_db_path, &session_id).await {
             tracing::error!("Failed to remove session from db: {}", e);
@@ -762,7 +835,8 @@ async fn messages_manage_action(
                 ));
             }
 
-            let expires_at = parse_message_expires_at_input(payload.expires_at.as_deref(), Utc::now())?;
+            let expires_at =
+                parse_message_expires_at_input(payload.expires_at.as_deref(), Utc::now())?;
             update_message(&state.config.message_db_path, &id, trimmed, expires_at).await?;
         }
         "delete" => {
@@ -824,6 +898,66 @@ async fn calendars_manage_action(
     }
 
     Ok(Redirect::to("/calendars/manage"))
+}
+
+async fn events_manage_page(
+    State(state): State<AppState>,
+    Query(query): Query<EventManageQuery>,
+) -> Result<Html<String>, AppError> {
+    let calendars = load_calendars_from_db(&state.config.message_db_path).await?;
+    if calendars.is_empty() {
+        return Ok(Html(render_dashboard_message(
+            &state.config.dashboard_title,
+            "Google カレンダーが未登録です",
+            "先にカレンダー設定から表示対象の Google カレンダー ID を登録してください。",
+            Some("/calendars/manage"),
+            Some("カレンダーを登録する"),
+        )));
+    }
+
+    let access_token = get_access_token(&state.client, &state.config).await?;
+    let annotations = load_event_annotations_from_db(&state.config.message_db_path).await?;
+    let events = fetch_calendar_events(
+        &state.client,
+        &calendars,
+        &access_token,
+        state.config.max_results,
+        &annotations,
+    )
+    .await?;
+
+    Ok(Html(render_event_manage_page(
+        &events,
+        state.config.user_auth_enabled(),
+        query.calendar_id.as_deref(),
+        query.event_id.as_deref(),
+    )))
+}
+
+async fn events_manage_action(
+    State(state): State<AppState>,
+    Form(payload): Form<ManageEventAnnotationForm>,
+) -> Result<Redirect, AppError> {
+    let calendar_id = payload.calendar_id.trim().to_string();
+    let event_id = payload.event_id.trim().to_string();
+    if calendar_id.is_empty() || event_id.is_empty() {
+        return Err(AppError::bad_request(
+            "calendar_id and event_id are required",
+        ));
+    }
+
+    let memo = normalize_event_memo_input(payload.memo)?;
+    let url = normalize_event_url_input(payload.url)?;
+    save_event_annotation(
+        &state.config.message_db_path,
+        &calendar_id,
+        &event_id,
+        &memo,
+        &url,
+    )
+    .await?;
+
+    Ok(Redirect::to("/events/manage"))
 }
 
 async fn auth_login(State(state): State<AppState>) -> Result<Redirect, AppError> {
@@ -895,9 +1029,15 @@ async fn calendar_events(
 ) -> Result<Utf8Json<GoogleCalendarEventsResponse>, AppError> {
     let calendars = load_calendars_from_db(&state.config.message_db_path).await?;
     let access_token = get_access_token(&state.client, &state.config).await?;
-    let response =
-        fetch_calendar_events(&state.client, &calendars, &access_token, state.config.max_results)
-            .await?;
+    let annotations = load_event_annotations_from_db(&state.config.message_db_path).await?;
+    let response = fetch_calendar_events(
+        &state.client,
+        &calendars,
+        &access_token,
+        state.config.max_results,
+        &annotations,
+    )
+    .await?;
     Ok(Utf8Json(response))
 }
 
@@ -1043,6 +1183,7 @@ async fn fetch_calendar_events(
     calendars: &[StoredCalendar],
     access_token: &str,
     max_results: u32,
+    annotations: &HashMap<String, EventAnnotation>,
 ) -> anyhow::Result<GoogleCalendarEventsResponse> {
     if calendars.is_empty() {
         return Ok(GoogleCalendarEventsResponse {
@@ -1070,6 +1211,15 @@ async fn fetch_calendar_events(
                 &calendar.title_prefix,
                 item.summary.as_deref(),
             ));
+            item.source_calendar_id = Some(calendar.calendar_id.clone());
+            if let Some(event_id) = item.id.as_deref() {
+                if let Some(annotation) =
+                    annotations.get(&event_annotation_key(&calendar.calendar_id, event_id))
+                {
+                    item.event_memo = non_empty_trimmed_string(&annotation.memo);
+                    item.event_url = non_empty_trimmed_string(&annotation.url);
+                }
+            }
         }
 
         summary_labels.push(
@@ -1181,10 +1331,16 @@ fn render_dashboard_page(
     } else {
         String::new()
     };
-    let calendar_actions = r#"<a href="/calendars/manage" class="hero-link-button">カレンダー設定</a>"#;
+    let calendar_actions =
+        r#"<a href="/calendars/manage" class="hero-link-button">カレンダー設定</a>"#;
+    let event_actions = r#"<a href="/events/manage" class="hero-link-button">予定メモ設定</a>"#;
 
     let (message_group_style, message_head_margin, message_title_font_size) = if has_messages {
-        ("margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid rgba(56, 42, 30, 0.1);", "12px", "18px")
+        (
+            "margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid rgba(56, 42, 30, 0.1);",
+            "12px",
+            "18px",
+        )
     } else {
         ("margin-bottom: 0px; padding-bottom: 1px;", "1px", "11px")
     };
@@ -1386,6 +1542,13 @@ fn render_dashboard_page(
             overflow: hidden;
         }}
         .primary-card:last-child {{ border-bottom: none; }}
+        .event-card-head {{
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 34px;
+            gap: 10px;
+            align-items: start;
+        }}
+        .event-main-copy {{ min-width: 0; display: grid; gap: 4px; }}
         .primary-time {{
             font-size: var(--time-size, 34px);
             line-height: 1.05;
@@ -1402,6 +1565,47 @@ fn render_dashboard_page(
             -webkit-line-clamp: var(--title-lines, 2);
             -webkit-box-orient: vertical;
             overflow: hidden;
+        }}
+        .event-meta {{
+            display: flex;
+            flex-wrap: wrap;
+            align-items: baseline;
+            gap: 6px 10px;
+            color: var(--muted);
+            font-size: var(--event-meta-size, 13px);
+            line-height: 1.35;
+            word-break: break-word;
+        }}
+        .event-link {{
+            color: var(--accent);
+            font-weight: 700;
+            text-decoration: none;
+            white-space: nowrap;
+        }}
+        .event-link:focus-visible, .event-link:hover {{ text-decoration: underline; }}
+        .event-edit-button {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            border-radius: 999px;
+            border: 1px solid rgba(56, 42, 30, 0.14);
+            color: var(--muted);
+            background: rgba(255,255,255,0.72);
+            text-decoration: none;
+            flex: 0 0 auto;
+        }}
+        .event-edit-button svg {{ width: 16px; height: 16px; stroke-width: 2.2; }}
+        .event-edit-button:hover,
+        .event-edit-button:focus-visible {{
+            color: var(--accent);
+            border-color: rgba(197, 92, 59, 0.32);
+            background: rgba(255,255,255,0.95);
+        }}
+        .event-edit-button.is-disabled {{
+            opacity: 0.35;
+            pointer-events: none;
         }}
         .empty {{
             display: grid;
@@ -1440,6 +1644,13 @@ fn render_dashboard_page(
             -webkit-line-clamp: var(--upcoming-title-lines, 2);
             -webkit-box-orient: vertical;
             overflow: hidden;
+        }}
+        .upcoming-copy {{ display: grid; gap: 3px; min-width: 0; }}
+        .upcoming-copy-head {{
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 32px;
+            gap: 8px;
+            align-items: start;
         }}
         .upcoming-list.fit-list {{
             gap: var(--upcoming-row-gap, 10px);
@@ -1507,6 +1718,7 @@ fn render_dashboard_page(
                 display: block;
                 overflow: visible;
             }}
+            .event-meta {{ font-size: 12px; }}
             .upcoming-list.fit-list {{
                 height: auto;
                 min-height: unset;
@@ -1565,6 +1777,7 @@ fn render_dashboard_page(
                     </select>
                 </form>
                 {calendar_actions}
+                {event_actions}
                 {session_actions}
             </div>
         </section>
@@ -1835,6 +2048,7 @@ fn render_dashboard_page(
         message_title_font_size = message_title_font_size,
         max_results_options = max_results_options,
         calendar_actions = calendar_actions,
+        event_actions = event_actions,
         session_actions = session_actions,
         today_label = escape_html(&sections.today_label),
         tomorrow_label = escape_html(&sections.tomorrow_label),
@@ -1942,6 +2156,12 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
             border-radius: 20px;
             border: 1px solid rgba(56, 42, 30, 0.1);
             background: rgba(255,255,255,0.54);
+            scroll-margin-top: 18px;
+        }}
+        .manage-item.is-selected {{
+            border-color: rgba(197, 92, 59, 0.34);
+            background: rgba(255,255,255,0.78);
+            box-shadow: 0 12px 34px rgba(197, 92, 59, 0.12);
         }}
         .manage-form {{ display: grid; gap: 12px; }}
         .manage-label {{ display: grid; gap: 8px; font-weight: 700; }}
@@ -2132,6 +2352,12 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
             border-radius: 20px;
             border: 1px solid rgba(56, 42, 30, 0.1);
             background: rgba(255,255,255,0.54);
+            scroll-margin-top: 18px;
+        }}
+        .manage-item.is-selected {{
+            border-color: rgba(197, 92, 59, 0.34);
+            background: rgba(255,255,255,0.78);
+            box-shadow: 0 12px 34px rgba(197, 92, 59, 0.12);
         }}
         .manage-form {{ display: grid; gap: 12px; }}
         .manage-label {{ display: grid; gap: 8px; font-weight: 700; }}
@@ -2183,6 +2409,7 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
                 <p class="subtitle">表示対象の Google カレンダー ID を複数登録できます。更新すると次回リロードから反映されます。</p>
                 <div class="toolbar">
                     <a class="link-button" href="/dashboard">ダッシュボードに戻る</a>
+                    <a class="link-button" href="/events/manage">予定メモ設定へ</a>
                     <a class="link-button" href="/messages/manage">伝言の編集へ</a>
                     {session_actions}
                 </div>
@@ -2208,6 +2435,224 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
 </html>"#,
         items = items,
         session_actions = session_actions,
+    )
+}
+
+fn render_event_manage_page(
+    events: &GoogleCalendarEventsResponse,
+    user_auth_enabled: bool,
+    selected_calendar_id: Option<&str>,
+    selected_event_id: Option<&str>,
+) -> String {
+    let session_actions = if user_auth_enabled {
+        format!(
+            r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="secondary-button">ログアウト</button></form>"#,
+            logout_path = USER_LOGOUT_PATH,
+        )
+    } else {
+        String::new()
+    };
+    let timezone = parse_calendar_timezone(events.time_zone.as_deref());
+    let selected_calendar_id = selected_calendar_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selected_event_id = selected_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut event_refs = events.items.iter().collect::<Vec<_>>();
+    event_refs.sort_by_key(|event| {
+        let is_selected = matches!(
+            (
+                selected_calendar_id,
+                selected_event_id,
+                event.source_calendar_id.as_deref(),
+                event.id.as_deref()
+            ),
+            (Some(selected_calendar_id), Some(selected_event_id), Some(calendar_id), Some(event_id))
+                if selected_calendar_id == calendar_id && selected_event_id == event_id
+        );
+        if is_selected { 0 } else { 1 }
+    });
+
+    let items = if events.items.is_empty() {
+        "<div class=\"manage-empty\">取得できる予定はありません</div>".to_string()
+    } else {
+        event_refs
+            .iter()
+            .filter_map(|event| {
+                let calendar_id = event.source_calendar_id.as_deref()?;
+                let event_id = event.id.as_deref()?;
+                let is_selected = matches!(
+                    (selected_calendar_id, selected_event_id),
+                    (Some(selected_calendar_id), Some(selected_event_id))
+                        if selected_calendar_id == calendar_id && selected_event_id == event_id
+                );
+                let item_id = if is_selected { r#" id="event-editor""# } else { "" };
+                let selected_class = if is_selected { " is-selected" } else { "" };
+                let rendered = render_event(event, timezone)?;
+                let date = rendered.date_label.unwrap_or_else(|| "-".to_string());
+                let memo = event.event_memo.as_deref().unwrap_or("");
+                let url = event.event_url.as_deref().unwrap_or("");
+
+                Some(format!(
+                    r#"<article{item_id} class="manage-item{selected_class}"><form method="post" action="/events/manage" class="manage-form"><input type="hidden" name="calendar_id" value="{calendar_id}"><input type="hidden" name="event_id" value="{event_id}"><div class="event-head"><div><div class="event-time">{date} {time}</div><h2 class="event-title">{title}</h2></div><a class="event-source" href="{google_url}" target="_blank" rel="noopener noreferrer">Googleで開く</a></div><label class="manage-label">メモ<textarea name="memo" maxlength="160" placeholder="この予定のタイトル下に小さく表示します">{memo}</textarea></label><label class="manage-label">URL<input type="url" name="url" value="{url}" maxlength="2048" placeholder="https://example.com"></label><div class="manage-meta">カレンダーID: {calendar_id}<br>予定ID: {event_id}</div><div class="manage-actions"><button type="submit" class="primary-button">保存する</button></div></form></article>"#,
+                    item_id = item_id,
+                    selected_class = selected_class,
+                    calendar_id = escape_html(calendar_id),
+                    event_id = escape_html(event_id),
+                    date = escape_html(&date),
+                    time = escape_html(&rendered.time_label),
+                    title = escape_html(&rendered.title),
+                    google_url = escape_html(event.html_link.as_deref().unwrap_or("#")),
+                    memo = escape_html(memo),
+                    url = escape_html(url),
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>予定メモ設定</title>
+    <style>
+        :root {{
+            --bg: #f7f1e3;
+            --panel: rgba(255, 252, 245, 0.92);
+            --line: rgba(56, 42, 30, 0.14);
+            --ink: #2f241b;
+            --muted: #7a6757;
+            --accent: #c55c3b;
+            --accent-soft: #efdbc8;
+            --shadow: 0 24px 70px rgba(77, 54, 33, 0.14);
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            margin: 0;
+            min-height: 100vh;
+            padding: 24px;
+            font-family: "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at top left, rgba(255, 214, 167, 0.9), transparent 28%),
+                radial-gradient(circle at bottom right, rgba(205, 116, 82, 0.24), transparent 24%),
+                linear-gradient(135deg, #fbf4e6 0%, #f4eadf 45%, #efe4d7 100%);
+        }}
+        main {{ max-width: 980px; margin: 0 auto; display: grid; gap: 20px; }}
+        .panel {{
+            border: 1px solid var(--line);
+            border-radius: 28px;
+            background: var(--panel);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+        }}
+        .panel-head {{ padding: 24px 26px 18px; border-bottom: 1px solid var(--line); }}
+        .panel-body {{ padding: 22px 24px 24px; }}
+        .eyebrow {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--accent);
+            background: var(--accent-soft);
+        }}
+        .title {{ margin: 12px 0 8px; font-size: 30px; line-height: 1.1; }}
+        .subtitle {{ margin: 0; color: var(--muted); line-height: 1.6; }}
+        .toolbar {{ display: flex; gap: 12px; flex-wrap: wrap; margin-top: 16px; }}
+        .manage-list {{ display: grid; gap: 16px; }}
+        .manage-item {{
+            display: grid;
+            gap: 12px;
+            padding: 18px;
+            border-radius: 20px;
+            border: 1px solid rgba(56, 42, 30, 0.1);
+            background: rgba(255,255,255,0.54);
+        }}
+        .manage-form {{ display: grid; gap: 12px; }}
+        .manage-label {{ display: grid; gap: 8px; font-weight: 700; }}
+        input[type="url"], textarea {{
+            width: 100%;
+            padding: 12px 14px;
+            border-radius: 16px;
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            background: rgba(255,255,255,0.88);
+            font: inherit;
+            color: inherit;
+        }}
+        textarea {{ min-height: 86px; resize: vertical; }}
+        .event-head {{ display: flex; justify-content: space-between; gap: 14px; align-items: flex-start; }}
+        .event-time {{ color: var(--muted); font-size: 13px; font-weight: 700; }}
+        .event-title {{ margin: 4px 0 0; font-size: 22px; line-height: 1.25; }}
+        .event-source {{ color: var(--accent); font-weight: 700; text-decoration: none; white-space: nowrap; }}
+        .event-source:hover, .event-source:focus-visible {{ text-decoration: underline; }}
+        .manage-actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .manage-meta {{ font-size: 12px; color: var(--muted); word-break: break-all; line-height: 1.5; }}
+        .primary-button, .secondary-button, .link-button {{
+            appearance: none;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 12px 18px;
+            border-radius: 999px;
+            font: inherit;
+            font-weight: 700;
+            text-decoration: none;
+            cursor: pointer;
+        }}
+        .primary-button {{ border: none; background: var(--accent); color: #fff; }}
+        .secondary-button, .link-button {{
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            background: rgba(255,255,255,0.82);
+            color: var(--ink);
+        }}
+        .manage-empty {{
+            padding: 18px;
+            border-radius: 18px;
+            border: 1px dashed rgba(101, 76, 53, 0.2);
+            color: var(--muted);
+            background: rgba(255,255,255,0.25);
+            text-align: center;
+        }}
+        @media (max-width: 768px) {{
+            body {{ padding: 16px; }}
+            .panel-head {{ padding: 18px 18px 14px; }}
+            .panel-body {{ padding: 16px 18px 18px; }}
+            .event-head {{ display: grid; }}
+            .title {{ font-size: 26px; }}
+        }}
+    </style>
+</head>
+<body>
+    <main>
+        <section class="panel">
+            <div class="panel-head">
+                <span class="eyebrow">Events</span>
+                <h1 class="title">予定メモ設定</h1>
+                <p class="subtitle">取得済みの予定ごとに、ダッシュボードで表示するメモとリンクを設定できます。</p>
+                <div class="toolbar">
+                    <a class="link-button" href="/dashboard">ダッシュボードに戻る</a>
+                    <a class="link-button" href="/calendars/manage">カレンダー設定へ</a>
+                    <a class="link-button" href="/messages/manage">伝言の編集へ</a>
+                    {session_actions}
+                </div>
+            </div>
+            <div class="panel-body">
+                <div class="manage-list">{items}</div>
+            </div>
+        </section>
+    </main>
+</body>
+</html>"#,
+        session_actions = session_actions,
+        items = items,
     )
 }
 
@@ -2430,9 +2875,7 @@ fn build_dashboard_sections(
                 registered_at_label: format_registered_at(
                     message.created_at.with_timezone(&timezone),
                 ),
-                expires_at_label: format_registered_at(
-                    message.expires_at.with_timezone(&timezone),
-                ),
+                expires_at_label: format_registered_at(message.expires_at.with_timezone(&timezone)),
             })
             .collect(),
         today_events,
@@ -2494,6 +2937,10 @@ fn render_event(event: &GoogleCalendarEvent, timezone: Tz) -> Option<DashboardEv
                 time_label,
                 date_label: Some(format_compact_date(start_dt.date_naive())),
                 title,
+                calendar_id: event.source_calendar_id.clone(),
+                event_id: event.id.clone(),
+                memo: event.event_memo.clone(),
+                url: event.event_url.clone(),
                 sort_key,
             });
         }
@@ -2509,6 +2956,10 @@ fn render_event(event: &GoogleCalendarEvent, timezone: Tz) -> Option<DashboardEv
                 time_label: "終日".to_string(),
                 date_label: Some(format_compact_date(parsed_date)),
                 title,
+                calendar_id: event.source_calendar_id.clone(),
+                event_id: event.id.clone(),
+                memo: event.event_memo.clone(),
+                url: event.event_url.clone(),
                 sort_key,
             });
         }
@@ -2528,11 +2979,15 @@ fn render_primary_event_cards(events: &[DashboardEvent], empty_message: &str) ->
         .map(|event| {
             let title = escape_html(&event.title);
             let time = escape_html(&event.time_label);
+            let meta = render_event_meta(event);
+            let edit_button = render_event_edit_button(event);
 
             format!(
-                r#"<article class="primary-card"><div class="primary-time">{time}</div><div class="primary-title">{title}</div></article>"#,
+                r#"<article class="primary-card"><div class="event-card-head"><div class="event-main-copy"><div class="primary-time">{time}</div><div class="primary-title">{title}</div>{meta}</div>{edit_button}</div></article>"#,
                 time = time,
                 title = title,
+                meta = meta,
+                edit_button = edit_button,
             )
         })
         .collect::<Vec<_>>()
@@ -2557,6 +3012,60 @@ fn render_primary_event_cards(events: &[DashboardEvent], empty_message: &str) ->
         title_lines = title_lines,
         cards = cards,
     )
+}
+
+fn render_event_meta(event: &DashboardEvent) -> String {
+    let memo = event
+        .memo
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(r#"<span>{}</span>"#, escape_html(value)))
+        .unwrap_or_default();
+    let link = event
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                r#"<a class="event-link" href="{url}" target="_blank" rel="noopener noreferrer">【リンク】</a>"#,
+                url = escape_html(value),
+            )
+        })
+        .unwrap_or_default();
+
+    if memo.is_empty() && link.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="event-meta">{memo}{link}</div>"#)
+    }
+}
+
+fn render_event_edit_button(event: &DashboardEvent) -> String {
+    let Some(href) = event_edit_href(event) else {
+        return r#"<span class="event-edit-button is-disabled" aria-hidden="true"></span>"#
+            .to_string();
+    };
+
+    format!(
+        r#"<a class="event-edit-button" href="{href}" aria-label="予定メモを編集" title="予定メモを編集"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></a>"#,
+        href = escape_html(&href),
+    )
+}
+
+fn event_edit_href(event: &DashboardEvent) -> Option<String> {
+    let calendar_id = event.calendar_id.as_deref()?.trim();
+    let event_id = event.event_id.as_deref()?.trim();
+    if calendar_id.is_empty() || event_id.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "/events/manage?calendar_id={calendar_id}&event_id={event_id}#event-editor",
+        calendar_id = urlencoding::encode(calendar_id),
+        event_id = urlencoding::encode(event_id),
+    ))
 }
 
 fn render_message_cards(messages: &[DashboardMessage], empty_message: &str) -> String {
@@ -2598,12 +3107,16 @@ fn render_upcoming_event_rows(events: &[DashboardEvent], empty_message: &str) ->
             let date_label = escape_html(event.date_label.as_deref().unwrap_or("-"));
             let time_label = escape_html(&event.time_label);
             let title = escape_html(&event.title);
+            let meta = render_event_meta(event);
+            let edit_button = render_event_edit_button(event);
 
             format!(
-            r#"<article class="upcoming-row"><div class="upcoming-date">{date}</div><div class="upcoming-time">{time}</div><div class="upcoming-title">{title}</div></article>"#,
+            r#"<article class="upcoming-row"><div class="upcoming-date">{date}</div><div class="upcoming-time">{time}</div><div class="upcoming-copy"><div class="upcoming-copy-head"><div class="upcoming-title">{title}</div>{edit_button}</div>{meta}</div></article>"#,
             date = date_label,
             time = time_label,
             title = title,
+            meta = meta,
+            edit_button = edit_button,
             )
         })
         .collect::<Vec<_>>()
@@ -2638,7 +3151,9 @@ fn parse_bool_env(name: &str, value: &str) -> anyhow::Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(anyhow!("{name} must be one of true/false/1/0/yes/no/on/off")),
+        _ => Err(anyhow!(
+            "{name} must be one of true/false/1/0/yes/no/on/off"
+        )),
     }
 }
 
@@ -2704,7 +3219,11 @@ fn clear_user_session_cookie() -> String {
 fn is_browser_route(path: &str) -> bool {
     matches!(
         path,
-        "/" | "/dashboard" | "/messages/manage" | "/calendars/manage" | "/auth/login"
+        "/" | "/dashboard"
+            | "/messages/manage"
+            | "/calendars/manage"
+            | "/events/manage"
+            | "/auth/login"
     )
 }
 
@@ -2790,7 +3309,11 @@ fn render_dashboard_max_results_options(selected_value: u32) -> String {
     (DEFAULT_DASHBOARD_MAX_RESULTS..=DASHBOARD_MAX_RESULTS_LIMIT)
         .step_by(DASHBOARD_MAX_RESULTS_STEP as usize)
         .map(|value| {
-            let selected = if value == selected_value { " selected" } else { "" };
+            let selected = if value == selected_value {
+                " selected"
+            } else {
+                ""
+            };
             format!(r#"<option value="{value}"{selected}>{value}件</option>"#)
         })
         .collect::<Vec<_>>()
@@ -2819,9 +3342,7 @@ fn parse_message_expires_at_input(
 
     let expires_at = parse_message_expires_at_value(value)?;
     if expires_at < now_utc {
-        return Err(AppError::bad_request(
-            "expires_at must be in the future",
-        ));
+        return Err(AppError::bad_request("expires_at must be in the future"));
     }
 
     Ok(expires_at)
@@ -2858,10 +3379,7 @@ fn normalize_calendar_id_input(calendar_id: Option<String>) -> Result<String, Ap
 }
 
 fn normalize_calendar_prefix_input(title_prefix: Option<String>) -> Result<String, AppError> {
-    let title_prefix = title_prefix
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    let title_prefix = title_prefix.unwrap_or_default().trim().to_string();
 
     if title_prefix.chars().count() > 80 {
         return Err(AppError::bad_request(
@@ -2870,6 +3388,49 @@ fn normalize_calendar_prefix_input(title_prefix: Option<String>) -> Result<Strin
     }
 
     Ok(title_prefix)
+}
+
+fn normalize_event_memo_input(memo: Option<String>) -> Result<String, AppError> {
+    let memo = memo.unwrap_or_default().trim().to_string();
+
+    if memo.chars().count() > 160 {
+        return Err(AppError::bad_request(
+            "memo must be 160 characters or fewer",
+        ));
+    }
+
+    Ok(memo)
+}
+
+fn normalize_event_url_input(url: Option<String>) -> Result<String, AppError> {
+    let url = url.unwrap_or_default().trim().to_string();
+    if url.is_empty() {
+        return Ok(url);
+    }
+
+    if url.chars().count() > 2048 {
+        return Err(AppError::bad_request(
+            "url must be 2048 characters or fewer",
+        ));
+    }
+
+    let parsed = Url::parse(&url).map_err(|_| AppError::bad_request("url must be a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::bad_request(
+            "url must start with http:// or https://",
+        ));
+    }
+
+    Ok(url)
+}
+
+fn non_empty_trimmed_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 fn apply_calendar_prefix(title_prefix: &str, summary: Option<&str>) -> String {
@@ -2911,9 +3472,19 @@ async fn init_message_db(message_db_path: &str) -> anyhow::Result<()> {
                 title_prefix TEXT NOT NULL DEFAULT '',
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS event_annotations (
+                calendar_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                memo TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (calendar_id, event_id)
             );",
         )?;
-        ensure_calendar_prefix_column(&connection)?;
+        ensure_calendar_columns(&connection)?;
+        ensure_event_annotation_table(&connection)?;
         Ok(())
     })
     .await
@@ -2985,10 +3556,8 @@ async fn delete_message(message_db_path: &str, id: &str) -> anyhow::Result<()> {
     let message_id = id.to_string();
     task::spawn_blocking(move || -> anyhow::Result<()> {
         let connection = open_message_db(&db_path)?;
-        let deleted_rows = connection.execute(
-            "DELETE FROM messages WHERE id = ?1",
-            params![message_id],
-        )?;
+        let deleted_rows =
+            connection.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
 
         if deleted_rows == 0 {
             return Err(anyhow!("message not found: {}", message_id));
@@ -3037,7 +3606,7 @@ async fn load_calendars_from_db(message_db_path: &str) -> anyhow::Result<Vec<Sto
     let db_path = message_db_path.to_string();
     task::spawn_blocking(move || -> anyhow::Result<Vec<StoredCalendar>> {
         let connection = open_message_db(&db_path)?;
-        ensure_calendar_prefix_column(&connection)?;
+        ensure_calendar_columns(&connection)?;
         let mut statement = connection.prepare(
             "SELECT calendar_id, title_prefix, created_at_ms, updated_at_ms
              FROM calendars
@@ -3071,7 +3640,7 @@ async fn insert_calendar(
     let title_prefix = title_prefix.to_string();
     task::spawn_blocking(move || -> anyhow::Result<()> {
         let connection = open_message_db(&db_path)?;
-        ensure_calendar_prefix_column(&connection)?;
+        ensure_calendar_columns(&connection)?;
         let now_ms = Utc::now().timestamp_millis();
         connection.execute(
             "INSERT INTO calendars (calendar_id, title_prefix, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
@@ -3097,7 +3666,7 @@ async fn update_calendar(
     let title_prefix = title_prefix.to_string();
     task::spawn_blocking(move || -> anyhow::Result<()> {
         let connection = open_message_db(&db_path)?;
-        ensure_calendar_prefix_column(&connection)?;
+        ensure_calendar_columns(&connection)?;
         let updated_rows = connection.execute(
             "UPDATE calendars SET calendar_id = ?1, title_prefix = ?2, updated_at_ms = ?3 WHERE calendar_id = ?4",
             params![new_calendar_id, title_prefix, Utc::now().timestamp_millis(), current_calendar_id],
@@ -3137,10 +3706,88 @@ async fn delete_calendar(message_db_path: &str, calendar_id: &str) -> anyhow::Re
     Ok(())
 }
 
+async fn load_event_annotations_from_db(
+    message_db_path: &str,
+) -> anyhow::Result<HashMap<String, EventAnnotation>> {
+    let db_path = message_db_path.to_string();
+    task::spawn_blocking(
+        move || -> anyhow::Result<HashMap<String, EventAnnotation>> {
+            let connection = open_message_db(&db_path)?;
+            ensure_event_annotation_table(&connection)?;
+            let mut statement = connection.prepare(
+                "SELECT calendar_id, event_id, memo, url
+             FROM event_annotations",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut annotations = HashMap::new();
+
+            while let Some(row) = rows.next()? {
+                let annotation = EventAnnotation {
+                    calendar_id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    memo: row.get(2)?,
+                    url: row.get(3)?,
+                };
+                annotations.insert(
+                    event_annotation_key(&annotation.calendar_id, &annotation.event_id),
+                    annotation,
+                );
+            }
+
+            Ok(annotations)
+        },
+    )
+    .await
+    .context("failed to join event annotation load task")?
+}
+
+async fn save_event_annotation(
+    message_db_path: &str,
+    calendar_id: &str,
+    event_id: &str,
+    memo: &str,
+    url: &str,
+) -> anyhow::Result<()> {
+    let db_path = message_db_path.to_string();
+    let calendar_id = calendar_id.to_string();
+    let event_id = event_id.to_string();
+    let memo = memo.to_string();
+    let url = url.to_string();
+    task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = open_message_db(&db_path)?;
+        ensure_event_annotation_table(&connection)?;
+
+        if memo.is_empty() && url.is_empty() {
+            connection.execute(
+                "DELETE FROM event_annotations WHERE calendar_id = ?1 AND event_id = ?2",
+                params![calendar_id, event_id],
+            )?;
+            return Ok(());
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        connection.execute(
+            "INSERT INTO event_annotations (calendar_id, event_id, memo, url, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(calendar_id, event_id)
+             DO UPDATE SET memo = excluded.memo, url = excluded.url, updated_at_ms = excluded.updated_at_ms",
+            params![calendar_id, event_id, memo, url, now_ms],
+        )?;
+        Ok(())
+    })
+    .await
+    .context("failed to join event annotation save task")??;
+
+    Ok(())
+}
+
 fn open_message_db(message_db_path: &str) -> anyhow::Result<Connection> {
     if let Some(parent) = Path::new(message_db_path).parent() {
         std::fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create message db directory: {}", parent.display())
+            format!(
+                "failed to create message db directory: {}",
+                parent.display()
+            )
         })?;
     }
 
@@ -3148,7 +3795,7 @@ fn open_message_db(message_db_path: &str) -> anyhow::Result<Connection> {
         .with_context(|| format!("failed to open sqlite database: {message_db_path}"))
 }
 
-fn ensure_calendar_prefix_column(connection: &Connection) -> anyhow::Result<()> {
+fn ensure_calendar_columns(connection: &Connection) -> anyhow::Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(calendars)")?;
     let mut rows = statement.query([])?;
     let mut has_title_prefix = false;
@@ -3157,7 +3804,6 @@ fn ensure_calendar_prefix_column(connection: &Connection) -> anyhow::Result<()> 
         let column_name: String = row.get(1)?;
         if column_name == "title_prefix" {
             has_title_prefix = true;
-            break;
         }
     }
 
@@ -3169,6 +3815,25 @@ fn ensure_calendar_prefix_column(connection: &Connection) -> anyhow::Result<()> 
     }
 
     Ok(())
+}
+
+fn ensure_event_annotation_table(connection: &Connection) -> anyhow::Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS event_annotations (
+            calendar_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            memo TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (calendar_id, event_id)
+        );",
+    )?;
+    Ok(())
+}
+
+fn event_annotation_key(calendar_id: &str, event_id: &str) -> String {
+    format!("{calendar_id}\n{event_id}")
 }
 
 fn prune_expired_messages_in_db(connection: &Connection, now_ms: i64) -> anyhow::Result<()> {
@@ -3239,9 +3904,8 @@ async fn is_valid_session_in_db(message_db_path: &str, session_id: &str) -> bool
 
     task::spawn_blocking(move || -> anyhow::Result<bool> {
         let connection = open_message_db(&db_path)?;
-        let mut stmt = connection.prepare(
-            "SELECT 1 FROM user_sessions WHERE session_id = ?1 AND expires_at_ms > ?2"
-        )?;
+        let mut stmt = connection
+            .prepare("SELECT 1 FROM user_sessions WHERE session_id = ?1 AND expires_at_ms > ?2")?;
         let exists = stmt.exists(params![session_id, now])?;
         Ok(exists)
     })
