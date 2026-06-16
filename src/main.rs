@@ -8,9 +8,9 @@ use axum::{
     routing::get,
 };
 use chrono::{
-    DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike, Utc,
+    DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone,
+    Timelike, Utc,
 };
-use chrono_tz::Tz;
 use reqwest::{Client, Url};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,6 @@ const DASHBOARD_RELOAD_SECONDS: i64 = 600;
 const DEFAULT_DASHBOARD_MAX_RESULTS: u32 = 10;
 const DASHBOARD_MAX_RESULTS_STEP: u32 = 10;
 const DASHBOARD_MAX_RESULTS_LIMIT: u32 = 40;
-const MESSAGE_TIMEZONE: Tz = chrono_tz::Asia::Tokyo;
 const USER_LOGIN_PATH: &str = "/user/login";
 const USER_LOGOUT_PATH: &str = "/user/logout";
 const USER_SESSION_COOKIE_NAME: &str = "uchimachi_dashboard_session";
@@ -197,6 +196,7 @@ struct ManageEventAnnotationForm {
     event_id: String,
     memo: Option<String>,
     url: Option<String>,
+    max_results: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -208,6 +208,7 @@ struct DashboardQuery {
 struct EventManageQuery {
     calendar_id: Option<String>,
     event_id: Option<String>,
+    max_results: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -904,6 +905,8 @@ async fn events_manage_page(
     State(state): State<AppState>,
     Query(query): Query<EventManageQuery>,
 ) -> Result<Html<String>, AppError> {
+    let selected_max_results =
+        resolve_dashboard_max_results(query.max_results, state.config.max_results);
     let calendars = load_calendars_from_db(&state.config.message_db_path).await?;
     if calendars.is_empty() {
         return Ok(Html(render_dashboard_message(
@@ -921,13 +924,14 @@ async fn events_manage_page(
         &state.client,
         &calendars,
         &access_token,
-        state.config.max_results,
+        selected_max_results,
         &annotations,
     )
     .await?;
 
     Ok(Html(render_event_manage_page(
         &events,
+        selected_max_results,
         state.config.user_auth_enabled(),
         query.calendar_id.as_deref(),
         query.event_id.as_deref(),
@@ -957,7 +961,15 @@ async fn events_manage_action(
     )
     .await?;
 
-    Ok(Redirect::to("/events/manage"))
+    let selected_max_results =
+        resolve_dashboard_max_results(payload.max_results, state.config.max_results);
+    let redirect_path = format!(
+        "/events/manage?max_results={max_results}&calendar_id={calendar_id}&event_id={event_id}#event-editor",
+        max_results = selected_max_results,
+        calendar_id = urlencoding::encode(&calendar_id),
+        event_id = urlencoding::encode(&event_id),
+    );
+    Ok(Redirect::to(&redirect_path))
 }
 
 async fn auth_login(State(state): State<AppState>) -> Result<Redirect, AppError> {
@@ -1317,11 +1329,21 @@ fn render_dashboard_page(
 
     let has_messages = !sections.messages.is_empty();
     let message_cards = render_message_cards(&sections.messages, "現在有効な伝言はありません");
-    let today_cards = render_primary_event_cards(&sections.today_events, "本日の予定はありません");
-    let tomorrow_cards =
-        render_primary_event_cards(&sections.tomorrow_events, "明日の予定はありません");
-    let upcoming_rows =
-        render_upcoming_event_rows(&sections.upcoming_events, "明後日以降の予定はありません");
+    let today_cards = render_primary_event_cards(
+        &sections.today_events,
+        "本日の予定はありません",
+        selected_max_results,
+    );
+    let tomorrow_cards = render_primary_event_cards(
+        &sections.tomorrow_events,
+        "明日の予定はありません",
+        selected_max_results,
+    );
+    let upcoming_rows = render_upcoming_event_rows(
+        &sections.upcoming_events,
+        "明後日以降の予定はありません",
+        selected_max_results,
+    );
     let max_results_options = render_dashboard_max_results_options(selected_max_results);
     let session_actions = if user_auth_enabled {
         format!(
@@ -1333,7 +1355,9 @@ fn render_dashboard_page(
     };
     let calendar_actions =
         r#"<a href="/calendars/manage" class="hero-link-button">カレンダー設定</a>"#;
-    let event_actions = r#"<a href="/events/manage" class="hero-link-button">予定メモ設定</a>"#;
+    let event_actions = format!(
+        r#"<a href="/events/manage?max_results={selected_max_results}" class="hero-link-button">予定メモ設定</a>"#
+    );
 
     let (message_group_style, message_head_margin, message_title_font_size) = if has_messages {
         (
@@ -2083,10 +2107,10 @@ fn render_message_manage_page(messages: &[StoredMessage], user_auth_enabled: boo
                     expires_at_value = escape_html(&expires_at_value),
                     min_expires_at = escape_html(&min_expires_at),
                     registered_at = escape_html(&format_registered_at(
-                        message.created_at.with_timezone(&MESSAGE_TIMEZONE)
+                        message.created_at.with_timezone(&message_timezone())
                     )),
                     expires_at = escape_html(&format_registered_at(
-                        message.expires_at.with_timezone(&MESSAGE_TIMEZONE)
+                        message.expires_at.with_timezone(&message_timezone())
                     )),
                 )
             })
@@ -2281,8 +2305,8 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
                     current_calendar_id = escape_html(&calendar.calendar_id),
                     calendar_id = escape_html(&calendar.calendar_id),
                     title_prefix = escape_html(&calendar.title_prefix),
-                    created_at = escape_html(&format_registered_at(calendar.created_at.with_timezone(&chrono_tz::Asia::Tokyo))),
-                    updated_at = escape_html(&format_registered_at(calendar.updated_at.with_timezone(&chrono_tz::Asia::Tokyo))),
+                    created_at = escape_html(&format_registered_at(calendar.created_at.with_timezone(&message_timezone()))),
+                    updated_at = escape_html(&format_registered_at(calendar.updated_at.with_timezone(&message_timezone()))),
                 )
             })
             .collect::<Vec<_>>()
@@ -2440,10 +2464,16 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
 
 fn render_event_manage_page(
     events: &GoogleCalendarEventsResponse,
+    selected_max_results: u32,
     user_auth_enabled: bool,
     selected_calendar_id: Option<&str>,
     selected_event_id: Option<&str>,
 ) -> String {
+    let dashboard_href = format!("/dashboard?max_results={selected_max_results}");
+    let messages_href = format!("/messages/manage?max_results={selected_max_results}");
+    let max_results_hidden = format!(
+        r#"<input type="hidden" name="max_results" value="{selected_max_results}">"#
+    );
     let session_actions = if user_auth_enabled {
         format!(
             r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="secondary-button">ログアウト</button></form>"#,
@@ -2495,9 +2525,10 @@ fn render_event_manage_page(
                 let url = event.event_url.as_deref().unwrap_or("");
 
                 Some(format!(
-                    r#"<article{item_id} class="manage-item{selected_class}"><form method="post" action="/events/manage" class="manage-form"><input type="hidden" name="calendar_id" value="{calendar_id}"><input type="hidden" name="event_id" value="{event_id}"><div class="event-head"><div><div class="event-time">{date} {time}</div><h2 class="event-title">{title}</h2></div><a class="event-source" href="{google_url}" target="_blank" rel="noopener noreferrer">Googleで開く</a></div><label class="manage-label">メモ<textarea name="memo" maxlength="160" placeholder="この予定のタイトル下に小さく表示します">{memo}</textarea></label><label class="manage-label">URL<input type="url" name="url" value="{url}" maxlength="2048" placeholder="https://example.com"></label><div class="manage-meta">カレンダーID: {calendar_id}<br>予定ID: {event_id}</div><div class="manage-actions"><button type="submit" class="primary-button">保存する</button></div></form></article>"#,
+                    r#"<article{item_id} class="manage-item{selected_class}"><form method="post" action="/events/manage" class="manage-form"><input type="hidden" name="calendar_id" value="{calendar_id}"><input type="hidden" name="event_id" value="{event_id}">{max_results_hidden}<div class="event-head"><div><div class="event-time">{date} {time}</div><h2 class="event-title">{title}</h2></div><a class="event-source" href="{google_url}" target="_blank" rel="noopener noreferrer">Googleで開く</a></div><label class="manage-label">メモ<textarea name="memo" maxlength="160" placeholder="この予定のタイトル下に小さく表示します">{memo}</textarea></label><label class="manage-label">URL<input type="url" name="url" value="{url}" maxlength="2048" placeholder="https://example.com"></label><div class="manage-meta">カレンダーID: {calendar_id}<br>予定ID: {event_id}</div><div class="manage-actions"><button type="submit" class="primary-button">保存する</button></div></form></article>"#,
                     item_id = item_id,
                     selected_class = selected_class,
+                    max_results_hidden = max_results_hidden,
                     calendar_id = escape_html(calendar_id),
                     event_id = escape_html(event_id),
                     date = escape_html(&date),
@@ -2638,9 +2669,9 @@ fn render_event_manage_page(
                 <h1 class="title">予定メモ設定</h1>
                 <p class="subtitle">取得済みの予定ごとに、ダッシュボードで表示するメモとリンクを設定できます。</p>
                 <div class="toolbar">
-                    <a class="link-button" href="/dashboard">ダッシュボードに戻る</a>
+                    <a class="link-button" href="{dashboard_href}">ダッシュボードに戻る</a>
                     <a class="link-button" href="/calendars/manage">カレンダー設定へ</a>
-                    <a class="link-button" href="/messages/manage">伝言の編集へ</a>
+                    <a class="link-button" href="{messages_href}">伝言の編集へ</a>
                     {session_actions}
                 </div>
             </div>
@@ -2653,6 +2684,8 @@ fn render_event_manage_page(
 </html>"#,
         session_actions = session_actions,
         items = items,
+        dashboard_href = escape_html(&dashboard_href),
+        messages_href = escape_html(&messages_href),
     )
 }
 
@@ -2884,7 +2917,7 @@ fn build_dashboard_sections(
     }
 }
 
-fn rendered_event_day(event: &GoogleCalendarEvent, timezone: Tz) -> Option<NaiveDate> {
+fn rendered_event_day(event: &GoogleCalendarEvent, timezone: FixedOffset) -> Option<NaiveDate> {
     if let Some(start) = &event.start {
         if let Some(date_time) = &start.date_time {
             let parsed = DateTime::parse_from_rfc3339(date_time).ok()?;
@@ -2899,7 +2932,7 @@ fn rendered_event_day(event: &GoogleCalendarEvent, timezone: Tz) -> Option<Naive
     None
 }
 
-fn render_event(event: &GoogleCalendarEvent, timezone: Tz) -> Option<DashboardEvent> {
+fn render_event(event: &GoogleCalendarEvent, timezone: FixedOffset) -> Option<DashboardEvent> {
     let title = event
         .summary
         .clone()
@@ -2968,7 +3001,11 @@ fn render_event(event: &GoogleCalendarEvent, timezone: Tz) -> Option<DashboardEv
     None
 }
 
-fn render_primary_event_cards(events: &[DashboardEvent], empty_message: &str) -> String {
+fn render_primary_event_cards(
+    events: &[DashboardEvent],
+    empty_message: &str,
+    selected_max_results: u32,
+) -> String {
     if events.is_empty() {
         return format!(r#"<div class="empty">{}</div>"#, escape_html(empty_message));
     }
@@ -2980,7 +3017,7 @@ fn render_primary_event_cards(events: &[DashboardEvent], empty_message: &str) ->
             let title = escape_html(&event.title);
             let time = escape_html(&event.time_label);
             let meta = render_event_meta(event);
-            let edit_button = render_event_edit_button(event);
+            let edit_button = render_event_edit_button(event, selected_max_results);
 
             format!(
                 r#"<article class="primary-card"><div class="event-card-head"><div class="event-main-copy"><div class="primary-time">{time}</div><div class="primary-title">{title}</div>{meta}</div>{edit_button}</div></article>"#,
@@ -3042,8 +3079,8 @@ fn render_event_meta(event: &DashboardEvent) -> String {
     }
 }
 
-fn render_event_edit_button(event: &DashboardEvent) -> String {
-    let Some(href) = event_edit_href(event) else {
+fn render_event_edit_button(event: &DashboardEvent, selected_max_results: u32) -> String {
+    let Some(href) = event_edit_href(event, selected_max_results) else {
         return r#"<span class="event-edit-button is-disabled" aria-hidden="true"></span>"#
             .to_string();
     };
@@ -3054,7 +3091,7 @@ fn render_event_edit_button(event: &DashboardEvent) -> String {
     )
 }
 
-fn event_edit_href(event: &DashboardEvent) -> Option<String> {
+fn event_edit_href(event: &DashboardEvent, selected_max_results: u32) -> Option<String> {
     let calendar_id = event.calendar_id.as_deref()?.trim();
     let event_id = event.event_id.as_deref()?.trim();
     if calendar_id.is_empty() || event_id.is_empty() {
@@ -3062,7 +3099,8 @@ fn event_edit_href(event: &DashboardEvent) -> Option<String> {
     }
 
     Some(format!(
-        "/events/manage?calendar_id={calendar_id}&event_id={event_id}#event-editor",
+        "/events/manage?max_results={max_results}&calendar_id={calendar_id}&event_id={event_id}#event-editor",
+        max_results = selected_max_results,
         calendar_id = urlencoding::encode(calendar_id),
         event_id = urlencoding::encode(event_id),
     ))
@@ -3087,7 +3125,11 @@ fn render_message_cards(messages: &[DashboardMessage], empty_message: &str) -> S
         .join("")
 }
 
-fn render_upcoming_event_rows(events: &[DashboardEvent], empty_message: &str) -> String {
+fn render_upcoming_event_rows(
+    events: &[DashboardEvent],
+    empty_message: &str,
+    selected_max_results: u32,
+) -> String {
     if events.is_empty() {
         return format!(r#"<div class="empty">{}</div>"#, escape_html(empty_message));
     }
@@ -3108,7 +3150,7 @@ fn render_upcoming_event_rows(events: &[DashboardEvent], empty_message: &str) ->
             let time_label = escape_html(&event.time_label);
             let title = escape_html(&event.title);
             let meta = render_event_meta(event);
-            let edit_button = render_event_edit_button(event);
+            let edit_button = render_event_edit_button(event, selected_max_results);
 
             format!(
             r#"<article class="upcoming-row"><div class="upcoming-date">{date}</div><div class="upcoming-time">{time}</div><div class="upcoming-copy"><div class="upcoming-copy-head"><div class="upcoming-title">{title}</div>{edit_button}</div>{meta}</div></article>"#,
@@ -3134,10 +3176,13 @@ fn render_upcoming_event_rows(events: &[DashboardEvent], empty_message: &str) ->
     )
 }
 
-fn parse_calendar_timezone(value: Option<&str>) -> Tz {
-    value
-        .and_then(|time_zone| time_zone.parse::<Tz>().ok())
-        .unwrap_or(chrono_tz::Asia::Tokyo)
+fn parse_calendar_timezone(value: Option<&str>) -> FixedOffset {
+    match value.map(str::trim) {
+        Some("UTC") | Some("Etc/UTC") | Some("Etc/GMT") => {
+            FixedOffset::east_opt(0).expect("UTC offset must be valid")
+        }
+        _ => message_timezone(),
+    }
 }
 
 fn read_optional_trimmed_env(name: &str) -> Option<String> {
@@ -3261,7 +3306,7 @@ fn format_compact_date(date: NaiveDate) -> String {
     )
 }
 
-fn format_registered_at(value: DateTime<Tz>) -> String {
+fn format_registered_at(value: DateTime<FixedOffset>) -> String {
     format!(
         "{}年{}月{}日 {:02}:{:02}",
         value.year(),
@@ -3326,7 +3371,7 @@ fn current_message_min_datetime_value() -> String {
 
 fn format_message_datetime_local_value(value: DateTime<Utc>) -> String {
     value
-        .with_timezone(&MESSAGE_TIMEZONE)
+        .with_timezone(&message_timezone())
         .format("%Y-%m-%dT%H:%M")
         .to_string()
 }
@@ -3356,11 +3401,15 @@ fn parse_message_expires_at_value(value: &str) -> Result<DateTime<Utc>, AppError
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
         .map_err(|_| AppError::bad_request("expires_at must be a valid datetime"))?;
 
-    MESSAGE_TIMEZONE
+    message_timezone()
         .from_local_datetime(&naive)
         .single()
         .map(|value| value.with_timezone(&Utc))
         .ok_or_else(|| AppError::bad_request("expires_at must be a valid datetime"))
+}
+
+fn message_timezone() -> FixedOffset {
+    FixedOffset::east_opt(9 * 60 * 60).expect("JST offset must be valid")
 }
 
 fn normalize_calendar_id_input(calendar_id: Option<String>) -> Result<String, AppError> {

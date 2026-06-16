@@ -7,7 +7,6 @@ edition = "2024"
 anyhow = "1.0"
 axum = "0.8"
 chrono = { version = "0.4", features = ["clock", "serde"] }
-chrono-tz = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = "0.37"
 serde = { version = "1.0", features = ["derive"] }

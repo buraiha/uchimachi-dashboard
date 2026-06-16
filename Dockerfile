@@ -5,6 +5,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ENV CARGO_BUILD_JOBS=1
 COPY Cargo.toml ./
 COPY src ./src
 RUN cargo build --release
