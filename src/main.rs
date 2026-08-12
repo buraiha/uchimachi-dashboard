@@ -29,7 +29,6 @@ const GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v
 const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.readonly";
 const DEFAULT_DASHBOARD_TITLE: &str = "うちまちダッシュボード";
-const DASHBOARD_RELOAD_SECONDS: i64 = 600;
 const DEFAULT_DASHBOARD_MAX_RESULTS: u32 = 10;
 const DASHBOARD_MAX_RESULTS_STEP: u32 = 10;
 const DASHBOARD_MAX_RESULTS_LIMIT: u32 = 40;
@@ -1524,7 +1523,6 @@ fn render_dashboard_page(
             white-space: nowrap;
         }}
         .title {{ margin: 0; font-size: 32px; line-height: 1.1; font-weight: 800; }}
-        .countdown {{ margin: 0; font-size: 14px; font-weight: 700; color: var(--accent); }}
         .subtitle {{ margin: 0; color: var(--muted); font-size: 15px; line-height: 1.6; }}
         .panel-body {{ overflow: auto; padding: 22px 24px 24px; }}
         .schedule-body {{ padding: 14px 20px 18px; overflow: auto; }}
@@ -1717,7 +1715,6 @@ fn render_dashboard_page(
             .hero-select {{ min-width: 96px; padding: 8px 30px 8px 12px; }}
             .eyebrow {{ font-size: 11px; padding: 5px 8px; }}
             .title {{ font-size: 28px; }}
-            .countdown {{ font-size: 13px; }}
             .section-title {{ font-size: 24px; }}
             .section-date, .subtitle {{ font-size: 13px; }}
             .message-body {{ font-size: 16px; }}
@@ -1791,7 +1788,6 @@ fn render_dashboard_page(
                     <span class="eyebrow">Dashboard</span>
                     <div class="head-copy">
                         <h1 class="title">{display_title}</h1>
-                        <p class="countdown">更新まで <span id="countdown">{reload_seconds}</span> 秒</p>
                     </div>
                 </div>
                 <form class="hero-controls" action="/dashboard" method="get">
@@ -1862,13 +1858,10 @@ fn render_dashboard_page(
         </section>
     </main>
     <script>
-        const reloadSeconds = {reload_seconds};
-        const countdownElement = document.getElementById("countdown");
         const maxResultsSelect = document.getElementById("max-results-select");
         const tabletMediaQuery = window.matchMedia("(max-width: 1024px)");
         const maxResultsStorageKey = "dashboard:max_results";
         const allowedMaxResults = new Set(["10", "20", "30", "40"]);
-        let remainingSeconds = reloadSeconds;
 
         const persistMaxResults = (value) => {{
             if (!allowedMaxResults.has(value)) {{
@@ -1923,13 +1916,6 @@ fn render_dashboard_page(
             }});
         }}
 
-        const renderCountdown = () => {{
-            if (countdownElement) {{
-                countdownElement.textContent = String(remainingSeconds);
-            }}
-        }};
-
-        renderCountdown();
         const fitPrimaryLists = () => {{
             if (tabletMediaQuery.matches) {{
                 document.querySelectorAll(".js-fit-primary-list").forEach((list) => {{
@@ -2052,20 +2038,11 @@ fn render_dashboard_page(
 
         fitPrimaryLists();
         window.addEventListener("resize", fitPrimaryLists);
-        window.setInterval(() => {{
-            remainingSeconds -= 1;
-            if (remainingSeconds <= 0) {{
-                window.location.reload();
-                return;
-            }}
-            renderCountdown();
-        }}, 1000);
     </script>
 </body>
 </html>"#,
         page_title = escape_html(dashboard_title),
         display_title = escape_html(dashboard_title),
-        reload_seconds = DASHBOARD_RELOAD_SECONDS,
         message_cards = message_cards,
         message_group_style = message_group_style,
         message_head_margin = message_head_margin,
