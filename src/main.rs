@@ -32,6 +32,8 @@ const DEFAULT_DASHBOARD_TITLE: &str = "うちまちダッシュボード";
 const DEFAULT_DASHBOARD_MAX_RESULTS: u32 = 10;
 const DASHBOARD_MAX_RESULTS_STEP: u32 = 10;
 const DASHBOARD_MAX_RESULTS_LIMIT: u32 = 40;
+const DEFAULT_CHART_DAYS: u8 = 3;
+const DEFAULT_CALENDAR_COLOR: &str = "#c55c3b";
 const USER_LOGIN_PATH: &str = "/user/login";
 const USER_LOGOUT_PATH: &str = "/user/logout";
 const USER_SESSION_COOKIE_NAME: &str = "uchimachi_dashboard_session";
@@ -187,6 +189,14 @@ struct ManageCalendarForm {
     current_calendar_id: Option<String>,
     calendar_id: Option<String>,
     title_prefix: Option<String>,
+    chart_color: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManageChartSettingsForm {
+    chart_visible: Option<String>,
+    chart_days: u8,
+    max_results: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -285,8 +295,24 @@ struct GoogleCalendarEventDateTime {
 struct StoredCalendar {
     calendar_id: String,
     title_prefix: String,
+    chart_color: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChartSettings {
+    visible: bool,
+    days: u8,
+}
+
+impl Default for ChartSettings {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            days: DEFAULT_CHART_DAYS,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -327,6 +353,18 @@ struct DashboardSections {
     today_events: Vec<DashboardEvent>,
     tomorrow_events: Vec<DashboardEvent>,
     upcoming_events: Vec<DashboardEvent>,
+}
+
+struct ChartDay {
+    date_label: String,
+    events: Vec<ChartEvent>,
+}
+
+struct ChartEvent {
+    time_label: String,
+    title: String,
+    color: String,
+    sort_key: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -415,6 +453,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(dashboard))
         .route("/dashboard", get(dashboard))
         .route(
+            "/dashboard/chart-settings",
+            axum::routing::post(chart_settings_action),
+        )
+        .route(
             "/calendars/manage",
             get(calendars_manage_page).post(calendars_manage_action),
         )
@@ -482,6 +524,18 @@ async fn dashboard(
             ));
         }
     };
+    let chart_settings = match load_chart_settings_from_db(&state.config.message_db_path).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            return Html(render_dashboard_message(
+                &state.config.dashboard_title,
+                "チャート設定の読み込みに失敗しました",
+                &error.to_string(),
+                None,
+                None,
+            ));
+        }
+    };
 
     if calendars.is_empty() {
         return Html(render_dashboard_message(
@@ -534,6 +588,8 @@ async fn dashboard(
                         selected_max_results,
                         &events,
                         &messages,
+                        &calendars,
+                        chart_settings,
                         state.config.user_auth_enabled(),
                     ),
                     Err(error) => render_dashboard_message(
@@ -565,6 +621,23 @@ async fn dashboard(
     Html(content)
 }
 
+async fn chart_settings_action(
+    State(state): State<AppState>,
+    Form(payload): Form<ManageChartSettingsForm>,
+) -> Result<Redirect, AppError> {
+    let settings = ChartSettings {
+        visible: payload.chart_visible.as_deref() == Some("1"),
+        days: normalize_chart_days(payload.chart_days)?,
+    };
+    save_chart_settings(&state.config.message_db_path, settings).await?;
+
+    let selected_max_results =
+        resolve_dashboard_max_results(payload.max_results, state.config.max_results);
+    Ok(Redirect::to(&format!(
+        "/dashboard?max_results={selected_max_results}"
+    )))
+}
+
 async fn service_info(State(state): State<AppState>) -> Utf8Json<ServiceInfo> {
     let calendars = load_calendars_from_db(&state.config.message_db_path)
         .await
@@ -581,6 +654,7 @@ async fn service_info(State(state): State<AppState>) -> Utf8Json<ServiceInfo> {
         endpoints: vec![
             "GET /",
             "GET /dashboard",
+            "POST /dashboard/chart-settings",
             "GET /api/info",
             "GET /calendars/manage",
             "POST /calendars/manage",
@@ -868,7 +942,14 @@ async fn calendars_manage_action(
         "create" => {
             let calendar_id = normalize_calendar_id_input(payload.calendar_id)?;
             let title_prefix = normalize_calendar_prefix_input(payload.title_prefix)?;
-            insert_calendar(&state.config.message_db_path, &calendar_id, &title_prefix).await?;
+            let chart_color = normalize_calendar_color_input(payload.chart_color)?;
+            insert_calendar(
+                &state.config.message_db_path,
+                &calendar_id,
+                &title_prefix,
+                &chart_color,
+            )
+            .await?;
         }
         "update" => {
             let current_calendar_id = payload
@@ -878,11 +959,13 @@ async fn calendars_manage_action(
                 .ok_or_else(|| AppError::bad_request("current calendar id is required"))?;
             let calendar_id = normalize_calendar_id_input(payload.calendar_id)?;
             let title_prefix = normalize_calendar_prefix_input(payload.title_prefix)?;
+            let chart_color = normalize_calendar_color_input(payload.chart_color)?;
             update_calendar(
                 &state.config.message_db_path,
                 &current_calendar_id,
                 &calendar_id,
                 &title_prefix,
+                &chart_color,
             )
             .await?;
         }
@@ -1322,6 +1405,8 @@ fn render_dashboard_page(
     selected_max_results: u32,
     events: &GoogleCalendarEventsResponse,
     messages: &[StoredMessage],
+    calendars: &[StoredCalendar],
+    chart_settings: ChartSettings,
     user_auth_enabled: bool,
 ) -> String {
     let sections = build_dashboard_sections(events, messages);
@@ -1344,6 +1429,17 @@ fn render_dashboard_page(
         selected_max_results,
     );
     let max_results_options = render_dashboard_max_results_options(selected_max_results);
+    let chart_days_options = render_chart_days_options(chart_settings.days);
+    let chart_visible_checked = if chart_settings.visible {
+        " checked"
+    } else {
+        ""
+    };
+    let chart_panel = if chart_settings.visible {
+        render_schedule_chart_panel(events, calendars, chart_settings.days)
+    } else {
+        String::new()
+    };
     let session_actions = if user_auth_enabled {
         format!(
             r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="hero-logout">ログアウト</button></form>"#,
@@ -1468,6 +1564,19 @@ fn render_dashboard_page(
             gap: 10px;
             margin-left: auto;
             white-space: nowrap;
+        }}
+        .chart-settings {{ flex-wrap: wrap; }}
+        .chart-toggle {{ display: inline-flex; align-items: center; gap: 6px; }}
+        .hero-save-button {{
+            appearance: none;
+            border: none;
+            border-radius: 999px;
+            padding: 10px 16px;
+            background: var(--accent);
+            color: #fff;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
         }}
         .hero-logout {{
             appearance: none;
@@ -1641,6 +1750,36 @@ fn render_dashboard_page(
             text-align: center;
         }}
         .upcoming-list {{ display: grid; gap: 12px; }}
+        .chart-body {{ overflow-x: auto; padding: 18px 20px 22px; }}
+        .chart-grid {{
+            display: grid;
+            grid-template-columns: repeat(var(--chart-days), minmax(180px, 1fr));
+            gap: 12px;
+            min-width: calc(var(--chart-days) * 180px);
+        }}
+        .chart-day {{
+            min-width: 0;
+            padding: 14px;
+            border: 1px solid rgba(56, 42, 30, 0.1);
+            border-radius: 18px;
+            background: rgba(255,255,255,0.48);
+        }}
+        .chart-day-title {{ margin: 0 0 12px; font-size: 15px; color: var(--muted); }}
+        .chart-events {{ display: grid; gap: 8px; }}
+        .chart-event {{
+            display: grid;
+            gap: 3px;
+            padding: 9px 10px;
+            border-left: 6px solid var(--event-color);
+            border-radius: 10px;
+            background: rgba(255,255,255,0.86);
+        }}
+        .chart-event-time {{ font-size: 12px; font-weight: 800; color: var(--muted); }}
+        .chart-event-title {{ font-size: 14px; line-height: 1.35; font-weight: 700; word-break: break-word; }}
+        .chart-empty {{ font-size: 13px; color: var(--muted); }}
+        .chart-legend {{ display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 14px; }}
+        .chart-legend-item {{ display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }}
+        .chart-legend-color {{ width: 11px; height: 11px; border-radius: 3px; background: var(--event-color); }}
         .upcoming-row {{
             display: grid;
             grid-template-columns: 112px 112px minmax(0, 1fr);
@@ -1796,12 +1935,22 @@ fn render_dashboard_page(
                         {max_results_options}
                     </select>
                 </form>
+                <form class="hero-controls chart-settings" action="/dashboard/chart-settings" method="post">
+                    <input type="hidden" name="max_results" value="{selected_max_results}">
+                    <label class="hero-control-label chart-toggle"><input type="checkbox" name="chart_visible" value="1"{chart_visible_checked}>チャート表示</label>
+                    <label class="hero-control-label" for="chart-days-select">日数</label>
+                    <select id="chart-days-select" class="hero-select" name="chart_days">
+                        {chart_days_options}
+                    </select>
+                    <button type="submit" class="hero-save-button">保存</button>
+                </form>
                 {calendar_actions}
                 {event_actions}
                 {session_actions}
             </div>
         </section>
         <section class="content">
+            {chart_panel}
             <section class="panel">
                 <div class="panel-head">
                     <div class="section-head-inline">
@@ -2048,6 +2197,10 @@ fn render_dashboard_page(
         message_head_margin = message_head_margin,
         message_title_font_size = message_title_font_size,
         max_results_options = max_results_options,
+        selected_max_results = selected_max_results,
+        chart_visible_checked = chart_visible_checked,
+        chart_days_options = chart_days_options,
+        chart_panel = chart_panel,
         calendar_actions = calendar_actions,
         event_actions = event_actions,
         session_actions = session_actions,
@@ -2278,10 +2431,11 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
             .iter()
             .map(|calendar| {
                 format!(
-                    r#"<article class="manage-item"><form method="post" action="/calendars/manage" class="manage-form"><input type="hidden" name="action" value="update"><input type="hidden" name="current_calendar_id" value="{current_calendar_id}"><label class="manage-label">カレンダー ID<input type="text" name="calendar_id" value="{calendar_id}" maxlength="255" required></label><label class="manage-label">予定タイトルのプレフィックス<input type="text" name="title_prefix" value="{title_prefix}" maxlength="80" placeholder="例: 【私用】"></label><div class="manage-meta">登録日時: {created_at} / 更新日時: {updated_at}</div><div class="manage-actions"><button type="submit" class="primary-button">更新する</button></div></form><form method="post" action="/calendars/manage" class="delete-form"><input type="hidden" name="action" value="delete"><input type="hidden" name="current_calendar_id" value="{current_calendar_id}"><button type="submit" class="secondary-button">削除</button></form></article>"#,
+                    r#"<article class="manage-item"><form method="post" action="/calendars/manage" class="manage-form"><input type="hidden" name="action" value="update"><input type="hidden" name="current_calendar_id" value="{current_calendar_id}"><label class="manage-label">カレンダー ID<input type="text" name="calendar_id" value="{calendar_id}" maxlength="255" required></label><label class="manage-label">予定タイトルのプレフィックス<input type="text" name="title_prefix" value="{title_prefix}" maxlength="80" placeholder="例: 【私用】"></label><label class="manage-label">チャートの表示色<input type="color" name="chart_color" value="{chart_color}" required></label><div class="manage-meta">登録日時: {created_at} / 更新日時: {updated_at}</div><div class="manage-actions"><button type="submit" class="primary-button">更新する</button></div></form><form method="post" action="/calendars/manage" class="delete-form"><input type="hidden" name="action" value="delete"><input type="hidden" name="current_calendar_id" value="{current_calendar_id}"><button type="submit" class="secondary-button">削除</button></form></article>"#,
                     current_calendar_id = escape_html(&calendar.calendar_id),
                     calendar_id = escape_html(&calendar.calendar_id),
                     title_prefix = escape_html(&calendar.title_prefix),
+                    chart_color = escape_html(&calendar.chart_color),
                     created_at = escape_html(&format_registered_at(calendar.created_at.with_timezone(&message_timezone()))),
                     updated_at = escape_html(&format_registered_at(calendar.updated_at.with_timezone(&message_timezone()))),
                 )
@@ -2371,6 +2525,15 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
             font: inherit;
             color: inherit;
         }}
+        input[type="color"] {{
+            width: 72px;
+            height: 46px;
+            padding: 4px;
+            border-radius: 12px;
+            border: 1px solid rgba(56, 42, 30, 0.16);
+            background: rgba(255,255,255,0.88);
+            cursor: pointer;
+        }}
         .manage-actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
         .manage-meta {{ font-size: 13px; color: var(--muted); }}
         .primary-button, .secondary-button, .link-button {{
@@ -2407,7 +2570,7 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
             <div class="panel-head">
                 <span class="eyebrow">Calendar</span>
                 <h1 class="title">Google カレンダー設定</h1>
-                <p class="subtitle">表示対象の Google カレンダー ID を複数登録できます。更新すると次回リロードから反映されます。</p>
+                <p class="subtitle">表示対象の Google カレンダー ID と、スケジュールチャートで使う色を設定できます。更新すると次回リロードから反映されます。</p>
                 <div class="toolbar">
                     <a class="link-button" href="/dashboard">ダッシュボードに戻る</a>
                     <a class="link-button" href="/events/manage">予定メモ設定へ</a>
@@ -2424,6 +2587,9 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
                     <label class="manage-label">予定タイトルのプレフィックス
                         <input type="text" name="title_prefix" maxlength="80" placeholder="例: 【私用】">
                     </label>
+                    <label class="manage-label">チャートの表示色
+                        <input type="color" name="chart_color" value="{default_calendar_color}" required>
+                    </label>
                     <div class="manage-actions">
                         <button type="submit" class="primary-button">追加する</button>
                     </div>
@@ -2436,6 +2602,7 @@ fn render_calendar_manage_page(calendars: &[StoredCalendar], user_auth_enabled: 
 </html>"#,
         items = items,
         session_actions = session_actions,
+        default_calendar_color = DEFAULT_CALENDAR_COLOR,
     )
 }
 
@@ -2892,6 +3059,123 @@ fn build_dashboard_sections(
         tomorrow_events,
         upcoming_events,
     }
+}
+
+fn render_schedule_chart_panel(
+    events: &GoogleCalendarEventsResponse,
+    calendars: &[StoredCalendar],
+    days: u8,
+) -> String {
+    let timezone = parse_calendar_timezone(events.time_zone.as_deref());
+    let today = Utc::now().with_timezone(&timezone).date_naive();
+    let mut chart_days = (0..days)
+        .filter_map(|offset| today.checked_add_signed(Duration::days(i64::from(offset))))
+        .map(|date| ChartDay {
+            date_label: format_date_header(date),
+            events: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let calendar_colors = calendars
+        .iter()
+        .map(|calendar| {
+            (
+                calendar.calendar_id.as_str(),
+                safe_calendar_color(&calendar.chart_color),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    for event in &events.items {
+        let Some(day) = rendered_event_day(event, timezone) else {
+            continue;
+        };
+        let day_offset = day.signed_duration_since(today).num_days();
+        if day_offset < 0 || day_offset >= i64::from(days) {
+            continue;
+        }
+        let Some(rendered) = render_event(event, timezone) else {
+            continue;
+        };
+        let color = event
+            .source_calendar_id
+            .as_deref()
+            .and_then(|calendar_id| calendar_colors.get(calendar_id))
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_CALENDAR_COLOR.to_string());
+        chart_days[day_offset as usize].events.push(ChartEvent {
+            time_label: rendered.time_label,
+            title: rendered.title,
+            color,
+            sort_key: rendered.sort_key,
+        });
+    }
+
+    let day_columns = chart_days
+        .iter_mut()
+        .map(|day| {
+            day.events.sort_by_key(|event| event.sort_key);
+            let event_cards = if day.events.is_empty() {
+                r#"<div class="chart-empty">予定はありません</div>"#.to_string()
+            } else {
+                day.events
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            r#"<article class="chart-event" style="--event-color:{color}"><div class="chart-event-time">{time}</div><div class="chart-event-title">{title}</div></article>"#,
+                            color = event.color,
+                            time = escape_html(&event.time_label),
+                            title = escape_html(&event.title),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            };
+            format!(
+                r#"<section class="chart-day"><h3 class="chart-day-title">{date}</h3><div class="chart-events">{events}</div></section>"#,
+                date = escape_html(&day.date_label),
+                events = event_cards,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let legend = calendars
+        .iter()
+        .map(|calendar| {
+            let label = if calendar.title_prefix.trim().is_empty() {
+                calendar.calendar_id.as_str()
+            } else {
+                calendar.title_prefix.as_str()
+            };
+            format!(
+                r#"<span class="chart-legend-item"><span class="chart-legend-color" style="--event-color:{color}"></span>{label}</span>"#,
+                color = safe_calendar_color(&calendar.chart_color),
+                label = escape_html(label),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    format!(
+        r#"<section class="panel"><div class="panel-head"><div class="section-head-inline"><span class="eyebrow">Chart</span><div class="head-copy"><h2 class="section-title">スケジュールチャート</h2><p class="subtitle">今日から {days} 日分の予定</p></div></div></div><div class="chart-body"><div class="chart-grid" style="--chart-days:{days}">{day_columns}</div><div class="chart-legend">{legend}</div></div></section>"#,
+        days = days,
+        day_columns = day_columns,
+        legend = legend,
+    )
+}
+
+fn render_chart_days_options(selected_days: u8) -> String {
+    [2_u8, 3, 7]
+        .into_iter()
+        .map(|days| {
+            let selected = if days == selected_days {
+                " selected"
+            } else {
+                ""
+            };
+            format!(r#"<option value="{days}"{selected}>{days}日</option>"#)
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 fn rendered_event_day(event: &GoogleCalendarEvent, timezone: FixedOffset) -> Option<NaiveDate> {
@@ -3416,6 +3700,44 @@ fn normalize_calendar_prefix_input(title_prefix: Option<String>) -> Result<Strin
     Ok(title_prefix)
 }
 
+fn normalize_calendar_color_input(chart_color: Option<String>) -> Result<String, AppError> {
+    let chart_color = chart_color
+        .unwrap_or_else(|| DEFAULT_CALENDAR_COLOR.to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if !is_valid_calendar_color(&chart_color) {
+        return Err(AppError::bad_request(
+            "chart color must use the #RRGGBB format",
+        ));
+    }
+
+    Ok(chart_color)
+}
+
+fn safe_calendar_color(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    if is_valid_calendar_color(&normalized) {
+        normalized
+    } else {
+        DEFAULT_CALENDAR_COLOR.to_string()
+    }
+}
+
+fn is_valid_calendar_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn normalize_chart_days(value: u8) -> Result<u8, AppError> {
+    normalize_chart_days_value(value)
+        .ok_or_else(|| AppError::bad_request("chart days must be 2, 3, or 7"))
+}
+
+fn normalize_chart_days_value(value: u8) -> Option<u8> {
+    matches!(value, 2 | 3 | 7).then_some(value)
+}
+
 fn normalize_event_memo_input(memo: Option<String>) -> Result<String, AppError> {
     let memo = memo.unwrap_or_default().trim().to_string();
 
@@ -3496,7 +3818,14 @@ async fn init_message_db(message_db_path: &str) -> anyhow::Result<()> {
             CREATE TABLE IF NOT EXISTS calendars (
                 calendar_id TEXT PRIMARY KEY,
                 title_prefix TEXT NOT NULL DEFAULT '',
+                chart_color TEXT NOT NULL DEFAULT '#c55c3b',
                 created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dashboard_preferences (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                chart_visible INTEGER NOT NULL DEFAULT 1,
+                chart_days INTEGER NOT NULL DEFAULT 3,
                 updated_at_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS event_annotations (
@@ -3510,6 +3839,7 @@ async fn init_message_db(message_db_path: &str) -> anyhow::Result<()> {
             );",
         )?;
         ensure_calendar_columns(&connection)?;
+        ensure_dashboard_preferences_table(&connection)?;
         ensure_event_annotation_table(&connection)?;
         Ok(())
     })
@@ -3634,7 +3964,7 @@ async fn load_calendars_from_db(message_db_path: &str) -> anyhow::Result<Vec<Sto
         let connection = open_message_db(&db_path)?;
         ensure_calendar_columns(&connection)?;
         let mut statement = connection.prepare(
-            "SELECT calendar_id, title_prefix, created_at_ms, updated_at_ms
+            "SELECT calendar_id, title_prefix, chart_color, created_at_ms, updated_at_ms
              FROM calendars
              ORDER BY updated_at_ms DESC, calendar_id ASC",
         )?;
@@ -3645,8 +3975,9 @@ async fn load_calendars_from_db(message_db_path: &str) -> anyhow::Result<Vec<Sto
             calendars.push(StoredCalendar {
                 calendar_id: row.get(0)?,
                 title_prefix: row.get(1)?,
-                created_at: millis_to_utc(row.get::<_, i64>(2)?)?,
-                updated_at: millis_to_utc(row.get::<_, i64>(3)?)?,
+                chart_color: row.get(2)?,
+                created_at: millis_to_utc(row.get::<_, i64>(3)?)?,
+                updated_at: millis_to_utc(row.get::<_, i64>(4)?)?,
             });
         }
 
@@ -3656,21 +3987,76 @@ async fn load_calendars_from_db(message_db_path: &str) -> anyhow::Result<Vec<Sto
     .context("failed to join calendar load task")?
 }
 
+async fn load_chart_settings_from_db(message_db_path: &str) -> anyhow::Result<ChartSettings> {
+    let db_path = message_db_path.to_string();
+    task::spawn_blocking(move || -> anyhow::Result<ChartSettings> {
+        let connection = open_message_db(&db_path)?;
+        ensure_dashboard_preferences_table(&connection)?;
+        let mut statement = connection
+            .prepare("SELECT chart_visible, chart_days FROM dashboard_preferences WHERE id = 1")?;
+        let mut rows = statement.query([])?;
+        let Some(row) = rows.next()? else {
+            return Ok(ChartSettings::default());
+        };
+        let days = row
+            .get::<_, i64>(1)
+            .ok()
+            .and_then(|value| u8::try_from(value).ok())
+            .and_then(normalize_chart_days_value)
+            .unwrap_or(DEFAULT_CHART_DAYS);
+
+        Ok(ChartSettings {
+            visible: row.get::<_, i64>(0)? != 0,
+            days,
+        })
+    })
+    .await
+    .context("failed to join chart settings load task")?
+}
+
+async fn save_chart_settings(message_db_path: &str, settings: ChartSettings) -> anyhow::Result<()> {
+    let db_path = message_db_path.to_string();
+    task::spawn_blocking(move || -> anyhow::Result<()> {
+        let connection = open_message_db(&db_path)?;
+        ensure_dashboard_preferences_table(&connection)?;
+        connection.execute(
+            "INSERT INTO dashboard_preferences (id, chart_visible, chart_days, updated_at_ms)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                chart_visible = excluded.chart_visible,
+                chart_days = excluded.chart_days,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                if settings.visible { 1 } else { 0 },
+                settings.days,
+                Utc::now().timestamp_millis(),
+            ],
+        )?;
+        Ok(())
+    })
+    .await
+    .context("failed to join chart settings save task")??;
+
+    Ok(())
+}
+
 async fn insert_calendar(
     message_db_path: &str,
     calendar_id: &str,
     title_prefix: &str,
+    chart_color: &str,
 ) -> anyhow::Result<()> {
     let db_path = message_db_path.to_string();
     let calendar_id = calendar_id.to_string();
     let title_prefix = title_prefix.to_string();
+    let chart_color = chart_color.to_string();
     task::spawn_blocking(move || -> anyhow::Result<()> {
         let connection = open_message_db(&db_path)?;
         ensure_calendar_columns(&connection)?;
         let now_ms = Utc::now().timestamp_millis();
         connection.execute(
-            "INSERT INTO calendars (calendar_id, title_prefix, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4)",
-            params![calendar_id, title_prefix, now_ms, now_ms],
+            "INSERT INTO calendars (calendar_id, title_prefix, chart_color, created_at_ms, updated_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![calendar_id, title_prefix, chart_color, now_ms, now_ms],
         )?;
         Ok(())
     })
@@ -3685,17 +4071,19 @@ async fn update_calendar(
     current_calendar_id: &str,
     new_calendar_id: &str,
     title_prefix: &str,
+    chart_color: &str,
 ) -> anyhow::Result<()> {
     let db_path = message_db_path.to_string();
     let current_calendar_id = current_calendar_id.to_string();
     let new_calendar_id = new_calendar_id.to_string();
     let title_prefix = title_prefix.to_string();
+    let chart_color = chart_color.to_string();
     task::spawn_blocking(move || -> anyhow::Result<()> {
         let connection = open_message_db(&db_path)?;
         ensure_calendar_columns(&connection)?;
         let updated_rows = connection.execute(
-            "UPDATE calendars SET calendar_id = ?1, title_prefix = ?2, updated_at_ms = ?3 WHERE calendar_id = ?4",
-            params![new_calendar_id, title_prefix, Utc::now().timestamp_millis(), current_calendar_id],
+            "UPDATE calendars SET calendar_id = ?1, title_prefix = ?2, chart_color = ?3, updated_at_ms = ?4 WHERE calendar_id = ?5",
+            params![new_calendar_id, title_prefix, chart_color, Utc::now().timestamp_millis(), current_calendar_id],
         )?;
 
         if updated_rows == 0 {
@@ -3825,11 +4213,15 @@ fn ensure_calendar_columns(connection: &Connection) -> anyhow::Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(calendars)")?;
     let mut rows = statement.query([])?;
     let mut has_title_prefix = false;
+    let mut has_chart_color = false;
 
     while let Some(row) = rows.next()? {
         let column_name: String = row.get(1)?;
         if column_name == "title_prefix" {
             has_title_prefix = true;
+        }
+        if column_name == "chart_color" {
+            has_chart_color = true;
         }
     }
 
@@ -3839,7 +4231,25 @@ fn ensure_calendar_columns(connection: &Connection) -> anyhow::Result<()> {
             [],
         )?;
     }
+    if !has_chart_color {
+        connection.execute(
+            "ALTER TABLE calendars ADD COLUMN chart_color TEXT NOT NULL DEFAULT '#c55c3b'",
+            [],
+        )?;
+    }
 
+    Ok(())
+}
+
+fn ensure_dashboard_preferences_table(connection: &Connection) -> anyhow::Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dashboard_preferences (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            chart_visible INTEGER NOT NULL DEFAULT 1,
+            chart_days INTEGER NOT NULL DEFAULT 3,
+            updated_at_ms INTEGER NOT NULL
+        );",
+    )?;
     Ok(())
 }
 
@@ -3956,4 +4366,128 @@ async fn remove_session_from_db(message_db_path: &str, session_id: &str) -> anyh
     .context("failed to join session remove task")??;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chart_days_accept_only_supported_values() {
+        assert_eq!(normalize_chart_days_value(2), Some(2));
+        assert_eq!(normalize_chart_days_value(3), Some(3));
+        assert_eq!(normalize_chart_days_value(7), Some(7));
+        assert_eq!(normalize_chart_days_value(1), None);
+        assert_eq!(normalize_chart_days_value(8), None);
+    }
+
+    #[test]
+    fn calendar_color_is_normalized_and_validated() {
+        assert_eq!(
+            normalize_calendar_color_input(Some(" #A1B2C3 ".to_string())).ok(),
+            Some("#a1b2c3".to_string())
+        );
+        assert!(normalize_calendar_color_input(Some("red".to_string())).is_err());
+        assert_eq!(safe_calendar_color("not-a-color"), DEFAULT_CALENDAR_COLOR);
+    }
+
+    #[test]
+    fn calendar_and_chart_schema_are_backward_compatible() -> anyhow::Result<()> {
+        let connection = Connection::open_in_memory()?;
+        connection.execute_batch(
+            "CREATE TABLE calendars (
+                calendar_id TEXT PRIMARY KEY,
+                title_prefix TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );",
+        )?;
+
+        ensure_calendar_columns(&connection)?;
+        ensure_dashboard_preferences_table(&connection)?;
+
+        let chart_color_default: String = connection.query_row(
+            "SELECT dflt_value FROM pragma_table_info('calendars') WHERE name = 'chart_color'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(chart_color_default, "'#c55c3b'");
+        let preference_table_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'dashboard_preferences'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(preference_table_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chart_settings_and_calendar_color_are_persisted() -> anyhow::Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "uchimachi-dashboard-chart-settings-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let db_path_string = db_path.to_string_lossy().into_owned();
+
+        init_message_db(&db_path_string).await?;
+        save_chart_settings(
+            &db_path_string,
+            ChartSettings {
+                visible: false,
+                days: 7,
+            },
+        )
+        .await?;
+        insert_calendar(&db_path_string, "calendar@example.com", "家族", "#123abc").await?;
+
+        let settings = load_chart_settings_from_db(&db_path_string).await?;
+        let calendars = load_calendars_from_db(&db_path_string).await?;
+        std::fs::remove_file(&db_path)?;
+
+        assert!(!settings.visible);
+        assert_eq!(settings.days, 7);
+        assert_eq!(calendars.len(), 1);
+        assert_eq!(calendars[0].chart_color, "#123abc");
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_chart_escapes_event_and_calendar_labels() {
+        let timezone = message_timezone();
+        let today = Utc::now().with_timezone(&timezone).date_naive();
+        let now = Utc::now();
+        let calendars = vec![StoredCalendar {
+            calendar_id: "calendar@example.com".to_string(),
+            title_prefix: "<家族>".to_string(),
+            chart_color: "#A1B2C3".to_string(),
+            created_at: now,
+            updated_at: now,
+        }];
+        let events = GoogleCalendarEventsResponse {
+            items: vec![GoogleCalendarEvent {
+                id: Some("event-1".to_string()),
+                status: Some("confirmed".to_string()),
+                summary: Some("<script>alert(1)</script>".to_string()),
+                html_link: None,
+                start: Some(GoogleCalendarEventDateTime {
+                    date: Some(today.format("%Y-%m-%d").to_string()),
+                    date_time: None,
+                    time_zone: None,
+                }),
+                end: None,
+                source_calendar_id: Some("calendar@example.com".to_string()),
+                event_memo: None,
+                event_url: None,
+            }],
+            summary: None,
+            time_zone: Some("Asia/Tokyo".to_string()),
+        };
+
+        let html = render_schedule_chart_panel(&events, &calendars, 2);
+        assert!(html.contains("--chart-days:2"));
+        assert!(html.contains("--event-color:#a1b2c3"));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(html.contains("&lt;家族&gt;"));
+        assert!(!html.contains("<script>alert(1)</script>"));
+    }
 }
