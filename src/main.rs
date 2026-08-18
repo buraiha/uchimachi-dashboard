@@ -1782,7 +1782,7 @@ fn render_dashboard_page(
         .chart-legend-color {{ width: 11px; height: 11px; border-radius: 3px; background: var(--event-color); }}
         .upcoming-row {{
             display: grid;
-            grid-template-columns: 112px 112px minmax(0, 1fr);
+            grid-template-columns: 112px minmax(0, 1fr);
             gap: var(--upcoming-gap, 14px);
             align-items: start;
             padding: var(--upcoming-padding-y, 8px) 2px;
@@ -1899,6 +1899,7 @@ fn render_dashboard_page(
             .hero-controls {{
                 margin-left: 0;
             }}
+            .upcoming-row {{ grid-template-columns: minmax(0, 1fr); }}
         }}
         @media (max-width: 1100px) {{
             body {{ overflow: auto; }}
@@ -3414,7 +3415,7 @@ fn render_upcoming_event_rows(
             let edit_button = render_event_edit_button(event, selected_max_results);
 
             format!(
-            r#"<article class="upcoming-row"><div class="upcoming-date">{date}</div><div class="upcoming-time">{time}</div><div class="upcoming-copy"><div class="upcoming-copy-head"><div class="upcoming-title">{title}</div>{edit_button}</div>{meta}</div></article>"#,
+            r#"<article class="upcoming-row"><div class="upcoming-date">{date}</div><div class="upcoming-copy"><div class="upcoming-time">{time}</div><div class="upcoming-copy-head"><div class="upcoming-title">{title}</div>{edit_button}</div>{meta}</div></article>"#,
             date = date_label,
             time = time_label,
             title = title,
@@ -4489,5 +4490,26 @@ mod tests {
         assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(html.contains("&lt;家族&gt;"));
         assert!(!html.contains("<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn upcoming_event_places_time_above_content() {
+        let events = vec![DashboardEvent {
+            time_label: "09:00 - 10:00".to_string(),
+            date_label: Some("8/20 (木)".to_string()),
+            title: "打ち合わせ".to_string(),
+            calendar_id: None,
+            event_id: None,
+            memo: Some("資料を確認".to_string()),
+            url: None,
+            sort_key: 0,
+        }];
+
+        let html = render_upcoming_event_rows(&events, "予定はありません", 10);
+
+        assert!(html.contains(
+            r#"<div class="upcoming-copy"><div class="upcoming-time">09:00 - 10:00</div><div class="upcoming-copy-head"><div class="upcoming-title">打ち合わせ</div>"#
+        ));
+        assert!(html.contains("資料を確認"));
     }
 }
