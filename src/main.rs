@@ -273,6 +273,8 @@ struct GoogleCalendarEvent {
     status: Option<String>,
     summary: Option<String>,
     html_link: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
     start: Option<GoogleCalendarEventDateTime>,
     end: Option<GoogleCalendarEventDateTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1319,15 +1321,7 @@ async fn fetch_calendar_events(
                 &calendar.title_prefix,
                 item.summary.as_deref(),
             ));
-            item.source_calendar_id = Some(calendar.calendar_id.clone());
-            if let Some(event_id) = item.id.as_deref() {
-                if let Some(annotation) =
-                    annotations.get(&event_annotation_key(&calendar.calendar_id, event_id))
-                {
-                    item.event_memo = non_empty_trimmed_string(&annotation.memo);
-                    item.event_url = non_empty_trimmed_string(&annotation.url);
-                }
-            }
+            apply_event_annotation(item, &calendar.calendar_id, annotations);
         }
 
         summary_labels.push(
@@ -1389,6 +1383,336 @@ async fn fetch_calendar_events_for_calendar_id(
         .context("failed to deserialize calendar events response")?;
 
     Ok(response)
+}
+
+// Apply only the annotation matching this calendar/event pair. Fetching never persists it.
+fn apply_event_annotation(
+    event: &mut GoogleCalendarEvent,
+    calendar_id: &str,
+    annotations: &HashMap<String, EventAnnotation>,
+) {
+    event.source_calendar_id = Some(calendar_id.to_string());
+    let annotation = event
+        .id
+        .as_deref()
+        .and_then(|id| annotations.get(&event_annotation_key(calendar_id, id)));
+    let (description_url, description_memo) =
+        extract_description_content(event.description.as_deref());
+    event.event_memo = annotation
+        .and_then(|value| non_empty_trimmed_string(&value.memo))
+        .or(description_memo);
+    event.event_url = annotation
+        .and_then(|value| non_empty_trimmed_string(&value.url))
+        .or(description_url);
+}
+
+fn decode_description_entities(value: &str) -> String {
+    let mut output = String::new();
+    let mut rest = value;
+    while let Some(index) = rest.find('&') {
+        output.push_str(&rest[..index]);
+        rest = &rest[index..];
+        let decoded = rest.find(';').filter(|end| *end <= 16).and_then(|end| {
+            let entity = &rest[1..end];
+            let character = match entity {
+                "amp" | "AMP" => Some('&'),
+                "quot" | "QUOT" => Some('"'),
+                "apos" => Some('\''),
+                "lt" | "LT" => Some('<'),
+                "gt" | "GT" => Some('>'),
+                "nbsp" => Some('\u{a0}'),
+                "colon" => Some(':'),
+                "sol" => Some('/'),
+                _ => entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+                    .or_else(|| {
+                        entity
+                            .strip_prefix('#')
+                            .and_then(|digits| digits.parse().ok())
+                    })
+                    .and_then(char::from_u32),
+            };
+            character.map(|character| (end + 1, character))
+        });
+        if let Some((end, character)) = decoded {
+            output.push(character);
+            rest = &rest[end..];
+        } else {
+            output.push('&');
+            rest = &rest[1..];
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn description_url_candidate(value: &str) -> Option<String> {
+    // Reject controls before Url::parse can silently strip them.
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    normalize_event_url_input(Some(value.to_string()))
+        .ok()
+        .filter(|url| !url.is_empty())
+}
+
+fn extract_text_url(text: &str) -> Option<String> {
+    let decoded = decode_description_entities(text);
+    for token in decoded.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '<' | '>' | '"' | '\'' | '、' | '。' | '「' | '」' | '（' | '）' | '【' | '】'
+            )
+    }) {
+        let Some(start) = token.char_indices().map(|(index, _)| index).find(|index| {
+            let suffix = &token[*index..];
+            suffix
+                .get(..7)
+                .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+                || suffix
+                    .get(..8)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+        }) else {
+            continue;
+        };
+        let token = &token[start..];
+        let mut candidate = token.trim_end_matches(['.', ',', ';', '!']);
+        loop {
+            let pair = match candidate.chars().last() {
+                Some(')') => ('(', ')'),
+                Some(']') => ('[', ']'),
+                Some('}') => ('{', '}'),
+                _ => break,
+            };
+            if candidate.matches(pair.1).count() <= candidate.matches(pair.0).count() {
+                break;
+            }
+            candidate = candidate[..candidate.len() - 1].trim_end_matches(['.', ',', ';', '!']);
+        }
+        if let Some(url) = description_url_candidate(candidate) {
+            return Some(url);
+        }
+    }
+    None
+}
+
+// This is intentionally broader than link validation: malformed or unsupported
+// URL-like strings must not leak into the imported memo either.
+fn find_description_url_like(value: &str) -> Option<usize> {
+    let mut scheme_start = 0;
+    for (index, character) in value.char_indices() {
+        let suffix = &value[index..];
+        if suffix
+            .get(..4)
+            .is_some_and(|s| s.eq_ignore_ascii_case("www."))
+            || suffix
+                .get(..7)
+                .is_some_and(|s| s.eq_ignore_ascii_case("mailto:"))
+        {
+            return Some(index);
+        }
+        if suffix.starts_with("://")
+            && scheme_start < index
+            && value.as_bytes()[scheme_start].is_ascii_alphabetic()
+        {
+            return Some(scheme_start);
+        }
+        if !(character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')) {
+            scheme_start = index + character.len_utf8();
+        }
+    }
+    None
+}
+
+fn clean_description_memo(text: &str) -> Option<String> {
+    let mut cleaned = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(start) = find_description_url_like(rest) {
+            cleaned.push_str(&rest[..start]);
+            rest = &rest[start..];
+            let end = rest
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '<' | '>'
+                                | '"'
+                                | '\''
+                                | '、'
+                                | '。'
+                                | '「'
+                                | '」'
+                                | '（'
+                                | '）'
+                                | '【'
+                                | '】'
+                        )
+                })
+                .unwrap_or(rest.len());
+            // Remove an ASCII wrapper around a URL along with its closing half.
+            for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+                if cleaned.ends_with(open)
+                    && rest[..end]
+                        .trim_end_matches(['.', ',', ';', '!'])
+                        .ends_with(close)
+                {
+                    cleaned.pop();
+                    break;
+                }
+            }
+            rest = &rest[end..];
+        } else {
+            cleaned.push_str(rest);
+            break;
+        }
+    }
+    let memo = cleaned
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Keep imported text compatible with the existing form/save limit.
+    non_empty_trimmed_string(&memo.chars().take(160).collect::<String>())
+}
+
+// A small, quote-aware scanner for Calendar descriptions, not an HTML renderer.
+// Only text nodes and actual a[href] attributes contribute candidates.
+fn extract_description_content(description: Option<&str>) -> (Option<String>, Option<String>) {
+    let mut rest = description.unwrap_or_default();
+    let mut first_url = None;
+    let mut text = String::new();
+    let mut inside_anchor = false;
+    let mut raw_element: Option<String> = None;
+    while !rest.is_empty() {
+        if !rest.starts_with('<') {
+            let end = rest.find('<').unwrap_or(rest.len());
+            if raw_element.is_none() {
+                if !inside_anchor && first_url.is_none() {
+                    first_url = extract_text_url(&rest[..end]);
+                }
+                text.push_str(&decode_description_entities(&rest[..end]));
+            }
+            rest = &rest[end..];
+            continue;
+        }
+        if rest.starts_with("<!--") {
+            let Some(end) = rest.find("-->") else {
+                break;
+            };
+            rest = &rest[end + 3..];
+            continue;
+        }
+        let mut quote = None;
+        let end = rest.char_indices().skip(1).find_map(|(index, c)| {
+            if quote == Some(c) {
+                quote = None;
+            } else if quote.is_none() {
+                if matches!(c, '\'' | '"') {
+                    quote = Some(c);
+                } else if c == '>' {
+                    return Some(index);
+                }
+            }
+            None
+        });
+        let Some(end) = end else {
+            if raw_element.is_none() {
+                text.push_str(&decode_description_entities(rest));
+            }
+            break;
+        };
+        let tag = rest[1..end].trim();
+        rest = &rest[end + 1..];
+        let closing = tag.starts_with('/');
+        let tag = tag.trim_start_matches('/');
+        let name_end = tag
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(tag.len());
+        let name = tag[..name_end].to_ascii_lowercase();
+        if let Some(raw) = &raw_element {
+            if closing && &name == raw {
+                raw_element = None;
+            }
+            continue;
+        }
+        if !closing && matches!(name.as_str(), "script" | "style") {
+            raw_element = Some(name);
+            continue;
+        }
+        if matches!(
+            name.as_str(),
+            "br" | "p"
+                | "div"
+                | "li"
+                | "ul"
+                | "ol"
+                | "tr"
+                | "hr"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "blockquote"
+        ) {
+            text.push('\n');
+        }
+        if name != "a" {
+            continue;
+        }
+        inside_anchor = !closing;
+        if closing {
+            continue;
+        }
+        let mut attributes = &tag[name_end..];
+        while !attributes.trim().is_empty() {
+            attributes = attributes.trim_start();
+            let end = attributes
+                .find(|c: char| c.is_whitespace() || c == '=')
+                .unwrap_or(attributes.len());
+            let name = &attributes[..end];
+            attributes = attributes[end..].trim_start();
+            if !attributes.starts_with('=') {
+                if end == 0 {
+                    break;
+                }
+                continue;
+            }
+            attributes = attributes[1..].trim_start();
+            let value;
+            if attributes.starts_with(['\'', '"']) {
+                let quote = attributes.as_bytes()[0] as char;
+                attributes = &attributes[1..];
+                let Some(end) = attributes.find(quote) else {
+                    break;
+                };
+                value = &attributes[..end];
+                attributes = &attributes[end + 1..];
+            } else {
+                let end = attributes
+                    .find(char::is_whitespace)
+                    .unwrap_or(attributes.len());
+                value = &attributes[..end];
+                attributes = &attributes[end..];
+            }
+            if name.eq_ignore_ascii_case("href") {
+                if first_url.is_none() {
+                    first_url = description_url_candidate(&decode_description_entities(value));
+                }
+                // Duplicate href attributes do not override the first one.
+                break;
+            }
+        }
+    }
+    (first_url, clean_description_memo(&text))
+}
+
+#[cfg(test)]
+fn extract_description_url(description: Option<&str>) -> Option<String> {
+    extract_description_content(description).0
 }
 
 fn event_sort_key(event: &GoogleCalendarEvent) -> i64 {
@@ -1747,6 +2071,7 @@ fn render_dashboard_page(
             line-height: 1.35;
             word-break: break-word;
         }}
+        .event-meta > span {{ white-space: pre-line; }}
         .event-link {{
             color: var(--accent);
             font-weight: 700;
@@ -4476,6 +4801,373 @@ async fn remove_session_from_db(message_db_path: &str, session_id: &str) -> anyh
 mod tests {
     use super::*;
 
+    #[test]
+    fn description_memo_removes_all_urls_and_blank_lines() {
+        let cases = [
+            (
+                "集合は10時\n\nhttps://example.com/first\n \t\n持ち物は筆記用具\nhttps://example.com/second",
+                Some("集合は10時\n持ち物は筆記用具"),
+            ),
+            (
+                "URL https://example.com/a を参照\r\n\r\n次の行",
+                Some("URL を参照\n次の行"),
+            ),
+            (
+                "https://example.com/first\nhttps://example.com/second\n  ",
+                None,
+            ),
+            ("(https://example.com/)\n[https://example.com/second]", None),
+            (
+                "WWW.example.com\nftp://example.com/file\nmailto:person@example.com\nhttps://[invalid\n残す本文",
+                Some("残す本文"),
+            ),
+            (
+                "<p>集合は<b>10時</b></p><div><br></div><div><a href='https://example.com/first'>案内ページ</a><br><a href='https://example.com/second'>https://example.com/label</a></div><p>持ち物 &amp; 注意</p>",
+                Some("集合は10時\n案内ページ\n持ち物 & 注意"),
+            ),
+            (
+                "<div>本文</div><!-- hidden --><script>secret</script><style>hidden</style><img src='https://example.com/image'><div>続き</div>",
+                Some("本文\n続き"),
+            ),
+            (
+                "&lt;テスト&gt;\n&nbsp;\nhttps&colon;&sol;&sol;example.com/\n終わり",
+                Some("<テスト>\n終わり"),
+            ),
+            ("", None),
+        ];
+        for (description, expected) in cases {
+            assert_eq!(
+                extract_description_content(Some(description)).1.as_deref(),
+                expected,
+                "{description}"
+            );
+        }
+        assert_eq!(extract_description_content(None), (None, None));
+        let (url, memo) = extract_description_content(Some(
+            "本文\nhttps://example.com/first\nhttps://example.com/second\n続き",
+        ));
+        assert_eq!(url.as_deref(), Some("https://example.com/first"));
+        assert_eq!(memo.as_deref(), Some("本文\n続き"));
+    }
+
+    #[test]
+    fn imported_memo_limit_applies_after_cleaning_and_is_safely_rendered() {
+        let mut events = event_editor_fixture();
+        let description = format!(
+            "https://example.com/{}\n\n{}",
+            "x".repeat(2100),
+            "あ".repeat(170)
+        );
+        events.items[0].description = Some(description.clone());
+        apply_event_annotation(
+            &mut events.items[0],
+            "calendar@example.com",
+            &HashMap::new(),
+        );
+        assert_eq!(
+            events.items[0].event_memo.as_deref(),
+            Some("あ".repeat(160).as_str())
+        );
+        assert_eq!(
+            events.items[0].description.as_deref(),
+            Some(description.as_str())
+        );
+        assert!(normalize_event_memo_input(events.items[0].event_memo.clone()).is_ok());
+        events.items[0].description = Some("&lt;img src=x onerror=alert(1)&gt;\n\n二行目\nhttps://example.com/first https://example.com/second".into());
+        apply_event_annotation(
+            &mut events.items[0],
+            "calendar@example.com",
+            &HashMap::new(),
+        );
+        let editor = render_event_manage_page(&events, 20, false, None, None);
+        let meta = render_event_meta(&render_event(&events.items[0], message_timezone()).unwrap());
+        for html in [&editor, &meta] {
+            assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;\n二行目"));
+            assert!(!html.contains("<img src=x"));
+            assert!(!html.contains("https://example.com/second"));
+        }
+    }
+
+    #[tokio::test]
+    async fn imported_memo_http_save_clear_and_refetch_preserves_independent_overrides()
+    -> anyhow::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("uchimachi-memo-import-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        let db = directory
+            .join("test.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let (url, server) = event_test_server(event_test_state(db.clone(), None)).await;
+        let client = Client::new();
+        let mut events = event_editor_fixture();
+        let event = &mut events.items[0];
+        event.description = Some(
+            "カレンダーの本文\n\nhttps://example.com/first\nhttps://example.com/second\n続き"
+                .into(),
+        );
+        let annotations = load_event_annotations_from_db(&db).await?;
+        let before = std::fs::read(&db)?;
+        apply_event_annotation(event, "calendar@example.com", &annotations);
+        assert_eq!(event.event_memo.as_deref(), Some("カレンダーの本文\n続き"));
+        assert_eq!(std::fs::read(&db)?, before);
+        for memo in [event.event_memo.clone().unwrap(), String::new()] {
+            let response = client.post(&url).header(header::ACCEPT, "application/json")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(format!("calendar_id=calendar%40example.com&event_id=event-1&memo={}&url=https%3A%2F%2Fmanual.example", urlencoding::encode(&memo)))
+                .send().await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.json::<serde_json::Value>().await?["saved"], true);
+            event.description = Some("変更後の本文\n\nhttps://example.com/new".into());
+            let annotations = load_event_annotations_from_db(&db).await?;
+            assert_eq!(
+                annotations[&event_annotation_key("calendar@example.com", "event-1")].memo,
+                memo
+            );
+            apply_event_annotation(event, "calendar@example.com", &annotations);
+            assert_eq!(
+                event.event_memo.as_deref(),
+                Some(if memo.is_empty() {
+                    "変更後の本文"
+                } else {
+                    &memo
+                })
+            );
+            assert_eq!(event.event_url.as_deref(), Some("https://manual.example"));
+            apply_event_annotation(event, "other-calendar", &annotations);
+            assert_eq!(event.event_memo.as_deref(), Some("変更後の本文"));
+            assert_eq!(event.event_url.as_deref(), Some("https://example.com/new"));
+        }
+        event.description = None;
+        apply_event_annotation(
+            event,
+            "calendar@example.com",
+            &load_event_annotations_from_db(&db).await?,
+        );
+        assert_eq!(event.event_memo, None);
+        // URL removal applies only to imported text, never to a saved manual memo.
+        save_event_annotation(
+            &db,
+            "calendar@example.com",
+            "event-1",
+            "手入力\n\nhttps://keep.example",
+            "",
+        )
+        .await?;
+        event.description = Some("自動メモ https://example.com/first".into());
+        apply_event_annotation(
+            event,
+            "calendar@example.com",
+            &load_event_annotations_from_db(&db).await?,
+        );
+        assert_eq!(
+            event.event_memo.as_deref(),
+            Some("手入力\n\nhttps://keep.example")
+        );
+        assert_eq!(
+            event.event_url.as_deref(),
+            Some("https://example.com/first")
+        );
+        server.abort();
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_description_url_extraction_cases() {
+        let cases = [
+            ("", None),
+            ("説明だけ", None),
+            (
+                "https://example.com/path?a=1&b=2",
+                Some("https://example.com/path?a=1&b=2"),
+            ),
+            (
+                "案内：https://example.com/path。次の文章",
+                Some("https://example.com/path"),
+            ),
+            (
+                "(https://example.com/a_(b)).",
+                Some("https://example.com/a_(b)"),
+            ),
+            (
+                "https://example.com/first https://example.com/second",
+                Some("https://example.com/first"),
+            ),
+            (
+                "https://[bad http:// https://example.com/good",
+                Some("https://example.com/good"),
+            ),
+            ("javascript:alert(1) ftp://example.com", None),
+            (
+                r#"<a href="javascript:alert(1)">https://wrong.example</a> https://example.com/good"#,
+                Some("https://example.com/good"),
+            ),
+            (
+                r#"<A title='x > y' HREF='https://example.com/?a=1&amp;b=2&#38;c=&#x33;'>https://wrong.example</A>"#,
+                Some("https://example.com/?a=1&b=2&c=3"),
+            ),
+            (
+                r#"<a data-href="https://wrong.example" href=https://example.com/path>label</a>"#,
+                Some("https://example.com/path"),
+            ),
+            (
+                r#"<a title="href='https://wrong.example'" href="https://example.com/">label</a>"#,
+                Some("https://example.com/"),
+            ),
+            (
+                r#"<img src="https://wrong.example"><!-- https://wrong.example --><script>https://wrong.example</script><style>https://wrong.example</style><p>https://example.com/</p>"#,
+                Some("https://example.com/"),
+            ),
+            (
+                r#"https://example.com/text <a href="https://second.example">link</a>"#,
+                Some("https://example.com/text"),
+            ),
+            (
+                r#"<a href="https://example.com/?x=&quot;value&quot;&amp;y=&lt;tag&gt;">link</a>"#,
+                Some("https://example.com/?x=\"value\"&y=<tag>"),
+            ),
+            (
+                r#"<a href="https://example.com/a(b).">link</a>"#,
+                Some("https://example.com/a(b)."),
+            ),
+            (
+                r#"<a href="https://example.com/&#10;bad">link</a> https://example.com/good"#,
+                Some("https://example.com/good"),
+            ),
+            (
+                r#"<a href="https://example.com/?a=&amp;amp;">link</a>"#,
+                Some("https://example.com/?a=&amp;"),
+            ),
+            ("<a href='unterminated", None),
+        ];
+        assert_eq!(extract_description_url(None), None);
+        for (description, expected) in cases {
+            assert_eq!(
+                extract_description_url(Some(description)).as_deref(),
+                expected,
+                "{description}"
+            );
+        }
+        let limit = format!("https://example.com/{}", "a".repeat(2028));
+        assert_eq!(limit.len(), 2048);
+        assert_eq!(extract_description_url(Some(&limit)), Some(limit.clone()));
+        let too_long = format!("{limit}a https://example.com/next");
+        assert_eq!(
+            extract_description_url(Some(&too_long)).as_deref(),
+            Some("https://example.com/next")
+        );
+    }
+
+    #[test]
+    fn imported_description_is_deserialized_and_safely_rendered() {
+        let mut events: GoogleCalendarEventsResponse = serde_json::from_value(serde_json::json!({
+            "items": [{"id": "event-1", "summary": "Example", "start": {"date": "2026-09-17"},
+                "description": "<a href='https://example.com/?a=&quot;x&quot;&amp;b=2'>link</a>"},
+                {"id": "missing"}, {"id": "null", "description": null}]
+        }))
+        .unwrap();
+        let original = events.items[0].description.clone();
+        for event in &mut events.items {
+            apply_event_annotation(event, "calendar@example.com", &HashMap::new());
+        }
+        assert_eq!(events.items[0].description, original);
+        assert_eq!(events.items[1].event_url, None);
+        assert_eq!(events.items[2].event_url, None);
+        let url = "https://example.com/?a=&quot;x&quot;&amp;b=2";
+        let editor = render_event_manage_page(&events, 20, false, None, None);
+        assert!(editor.contains(&format!("value=\"{url}\"")));
+        let event = render_event(&events.items[0], message_timezone()).unwrap();
+        let meta = render_event_meta(&event);
+        assert!(meta.contains(&format!("href=\"{url}\"")));
+        assert!(meta.contains("【リンク】"));
+        assert!(!editor.contains("<a href='"));
+    }
+
+    #[tokio::test]
+    async fn imported_url_save_clear_refetch_and_calendar_isolation() -> anyhow::Result<()> {
+        let directory = std::env::temp_dir().join(format!("uchimachi-import-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        let db = directory
+            .join("test.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        save_event_annotation(
+            &db,
+            "other-calendar",
+            "event-1",
+            "other memo",
+            "https://other.example",
+        )
+        .await?;
+        save_event_annotation(&db, "calendar@example.com", "event-1", "manual memo", "").await?;
+        let before = std::fs::read(&db)?;
+        let mut events = event_editor_fixture();
+        let event = &mut events.items[0];
+        event.description = Some("https://example.com/imported?a=1&b=2".into());
+        let annotations = load_event_annotations_from_db(&db).await?;
+        apply_event_annotation(event, "calendar@example.com", &annotations);
+        assert_eq!(event.event_memo.as_deref(), Some("manual memo"));
+        assert_eq!(
+            event.event_url.as_deref(),
+            Some("https://example.com/imported?a=1&b=2")
+        );
+        assert_eq!(
+            std::fs::read(&db)?,
+            before,
+            "retrieval must not write annotations"
+        );
+        let (url, server) = event_test_server(event_test_state(db.clone(), None)).await;
+        let client = Client::new();
+        for saved_url in [event.event_url.clone().unwrap(), String::new()] {
+            let response = client
+                .post(&url)
+                .header(header::ACCEPT, "application/json")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(format!(
+                    "calendar_id=calendar%40example.com&event_id=event-1&memo=manual%20memo&url={}",
+                    urlencoding::encode(&saved_url)
+                ))
+                .send()
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.json::<serde_json::Value>().await?["saved"], true);
+            event.description = Some("https://example.com/changed".into());
+            let annotations = load_event_annotations_from_db(&db).await?;
+            apply_event_annotation(event, "calendar@example.com", &annotations);
+            assert_eq!(
+                event.event_url.as_deref(),
+                Some(if saved_url.is_empty() {
+                    "https://example.com/changed"
+                } else {
+                    &saved_url
+                })
+            );
+            assert_eq!(event.event_memo.as_deref(), Some("manual memo"));
+            assert_eq!(
+                annotations[&event_annotation_key("other-calendar", "event-1")].url,
+                "https://other.example"
+            );
+        }
+        event.description = None;
+        let annotations = load_event_annotations_from_db(&db).await?;
+        apply_event_annotation(event, "calendar@example.com", &annotations);
+        assert_eq!(
+            event.event_url, None,
+            "htmlLink must not become a related link"
+        );
+        assert!(
+            !render_event_meta(&render_event(event, message_timezone()).unwrap())
+                .contains("【リンク】")
+        );
+        apply_event_annotation(event, "other-calendar", &annotations);
+        assert_eq!(event.event_url.as_deref(), Some("https://other.example"));
+        assert_eq!(event.event_memo.as_deref(), Some("other memo"));
+        server.abort();
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
     fn event_editor_fixture() -> GoogleCalendarEventsResponse {
         GoogleCalendarEventsResponse {
             items: (1..=2)
@@ -4484,6 +5176,7 @@ mod tests {
                     status: Some("confirmed".into()),
                     summary: Some(format!("予定 {index} <テスト>")),
                     html_link: Some("https://example.com".into()),
+                    description: None,
                     start: Some(GoogleCalendarEventDateTime {
                         date: Some("2026-09-17".into()),
                         date_time: None,
@@ -4806,6 +5499,7 @@ mod tests {
                 status: Some("confirmed".to_string()),
                 summary: Some("<script>alert(1)</script>".to_string()),
                 html_link: None,
+                description: None,
                 start: Some(GoogleCalendarEventDateTime {
                     date: Some(today.format("%Y-%m-%d").to_string()),
                     date_time: None,
