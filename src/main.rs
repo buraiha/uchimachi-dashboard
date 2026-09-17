@@ -1558,6 +1558,32 @@ fn render_dashboard_page(
             min-width: 0;
             text-align: left;
         }}
+        .hero > .head-inline {{ flex-wrap: wrap; }}
+        .hero-heading {{ min-width: 0; max-width: 100%; }}
+        .hero-title-row {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: 0;
+            max-width: 100%;
+        }}
+        .hero-title-row .title {{ min-width: 0; overflow-wrap: anywhere; }}
+        .hero-refresh {{
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 44px;
+            width: 44px;
+            height: 44px;
+            padding: 0;
+            border: 1px solid var(--line);
+            border-radius: 50%;
+            background: rgba(255,255,255,0.82);
+            color: var(--accent);
+            cursor: pointer;
+        }}
+        .hero-refresh:hover {{ background: var(--accent-soft); }}
+        .hero-refresh:focus-visible {{ outline: 3px solid var(--accent); outline-offset: 3px; }}
         .hero-controls {{
             display: flex;
             align-items: center;
@@ -1924,10 +1950,16 @@ fn render_dashboard_page(
     <main class="shell">
         <section class="panel hero hero-panel">
             <div class="head-inline">
-                <div class="head-inline" style="justify-content:flex-start;">
+                <div class="head-inline hero-heading" style="justify-content:flex-start;">
                     <span class="eyebrow">Dashboard</span>
-                    <div class="head-copy">
+                    <div class="hero-title-row">
                         <h1 class="title">{display_title}</h1>
+                        <button id="dashboard-refresh" class="hero-refresh" type="button" aria-label="ダッシュボードを更新" title="ダッシュボードを更新">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+                                <path d="M20 7v5h-5M4 17v-5h5" />
+                                <path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17" />
+                            </svg>
+                        </button>
                     </div>
                 </div>
                 <form class="hero-controls" action="/dashboard" method="get">
@@ -2008,6 +2040,11 @@ fn render_dashboard_page(
         </section>
     </main>
     <script>
+        const dashboardRefresh = document.getElementById("dashboard-refresh");
+        dashboardRefresh.addEventListener("click", () => {{
+            window.location.reload();
+        }});
+
         const maxResultsSelect = document.getElementById("max-results-select");
         const tabletMediaQuery = window.matchMedia("(max-width: 1024px)");
         const maxResultsStorageKey = "dashboard:max_results";
@@ -4372,6 +4409,39 @@ async fn remove_session_from_db(message_db_path: &str, session_id: &str) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dashboard_refresh_preserves_controls_and_escapes_title() {
+        let events = GoogleCalendarEventsResponse {
+            items: vec![],
+            summary: None,
+            time_zone: Some("Asia/Tokyo".to_string()),
+        };
+        for user_auth_enabled in [false, true] {
+            let html = render_dashboard_page(
+                "<テスト>&ダッシュボード",
+                20,
+                &events,
+                &[],
+                &[],
+                ChartSettings {
+                    visible: false,
+                    days: 7,
+                },
+                user_auth_enabled,
+            );
+            assert_eq!(html.matches("id=\"dashboard-refresh\"").count(), 1);
+            assert!(html.contains(
+                r#"class="hero-refresh" type="button" aria-label="ダッシュボードを更新""#
+            ));
+            assert!(html.contains("&lt;テスト&gt;&amp;ダッシュボード"));
+            assert!(!html.contains("<テスト>"));
+            assert!(html.contains(r#"<option value="20" selected>"#));
+            assert!(html.contains(r#"<option value="7" selected>"#));
+            assert!(html.contains("本日の予定はありません"));
+            assert_eq!(html.contains("class=\"hero-logout\""), user_auth_enabled);
+        }
+    }
 
     #[test]
     fn chart_days_accept_only_supported_values() {
