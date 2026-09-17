@@ -137,6 +137,16 @@ podman compose up -d --build
 - HTTPS 経由で公開するなら `DASHBOARD_AUTH_COOKIE_SECURE=true` にしてください
 - 初回だけブラウザで `/auth/login` を開いて認可を完了してください
 
+## 更新手順
+
+main ブランチで以下を実行します。
+
+```bash
+./release.sh
+```
+
+スクリプトの配置ディレクトリで `git pull origin`、`podman compose down`、`podman compose up -d --build` を順に実行します。main 以外（detached HEAD を含む）では実行できず、各コマンドが失敗すると後続処理を停止します。コンテナ停止からビルド・起動の完了までサービスは停止し、ビルド・起動に失敗した場合の自動復旧は行いません。
+
 ## ローカル実行
 
 Rust で直接動かす場合は、同じ環境変数をセットして起動できます。
