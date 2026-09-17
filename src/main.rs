@@ -1022,8 +1022,9 @@ async fn events_manage_page(
 
 async fn events_manage_action(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(payload): Form<ManageEventAnnotationForm>,
-) -> Result<Redirect, AppError> {
+) -> Result<Response, AppError> {
     let calendar_id = payload.calendar_id.trim().to_string();
     let event_id = payload.event_id.trim().to_string();
     if calendar_id.is_empty() || event_id.is_empty() {
@@ -1043,6 +1044,19 @@ async fn events_manage_action(
     )
     .await?;
 
+    if headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        == Some("application/json")
+    {
+        return Ok(Utf8Json(serde_json::json!({
+            "saved": true,
+            "calendar_id": calendar_id,
+            "event_id": event_id,
+        }))
+        .into_response());
+    }
+
     let selected_max_results =
         resolve_dashboard_max_results(payload.max_results, state.config.max_results);
     let redirect_path = format!(
@@ -1051,7 +1065,7 @@ async fn events_manage_action(
         calendar_id = urlencoding::encode(&calendar_id),
         event_id = urlencoding::encode(&event_id),
     );
-    Ok(Redirect::to(&redirect_path))
+    Ok(Redirect::to(&redirect_path).into_response())
 }
 
 async fn auth_login(State(state): State<AppState>) -> Result<Redirect, AppError> {
@@ -2653,9 +2667,8 @@ fn render_event_manage_page(
 ) -> String {
     let dashboard_href = format!("/dashboard?max_results={selected_max_results}");
     let messages_href = format!("/messages/manage?max_results={selected_max_results}");
-    let max_results_hidden = format!(
-        r#"<input type="hidden" name="max_results" value="{selected_max_results}">"#
-    );
+    let max_results_hidden =
+        format!(r#"<input type="hidden" name="max_results" value="{selected_max_results}">"#);
     let session_actions = if user_auth_enabled {
         format!(
             r#"<form method="post" action="{logout_path}" style="margin:0;"><button type="submit" class="secondary-button">ログアウト</button></form>"#,
@@ -2707,7 +2720,7 @@ fn render_event_manage_page(
                 let url = event.event_url.as_deref().unwrap_or("");
 
                 Some(format!(
-                    r#"<article{item_id} class="manage-item{selected_class}"><form method="post" action="/events/manage" class="manage-form"><input type="hidden" name="calendar_id" value="{calendar_id}"><input type="hidden" name="event_id" value="{event_id}">{max_results_hidden}<div class="event-head"><div><div class="event-time">{date} {time}</div><h2 class="event-title">{title}</h2></div><a class="event-source" href="{google_url}" target="_blank" rel="noopener noreferrer">Googleで開く</a></div><label class="manage-label">メモ<textarea name="memo" maxlength="160" placeholder="この予定のタイトル下に小さく表示します">{memo}</textarea></label><label class="manage-label">URL<input type="url" name="url" value="{url}" maxlength="2048" placeholder="https://example.com"></label><div class="manage-meta">カレンダーID: {calendar_id}<br>予定ID: {event_id}</div><div class="manage-actions"><button type="submit" class="primary-button">保存する</button></div></form></article>"#,
+                    r#"<article{item_id} class="manage-item{selected_class}"><form method="post" action="/events/manage" class="manage-form"><input type="hidden" name="calendar_id" value="{calendar_id}"><input type="hidden" name="event_id" value="{event_id}">{max_results_hidden}<div class="event-head"><div><div class="event-time">{date} {time}</div><h2 class="event-title">{title}</h2></div><a class="event-source" href="{google_url}" target="_blank" rel="noopener noreferrer">Googleで開く</a></div><label class="manage-label">メモ<textarea name="memo" maxlength="160" placeholder="この予定のタイトル下に小さく表示します">{memo}</textarea></label><label class="manage-label">URL<input type="url" name="url" value="{url}" maxlength="2048" placeholder="https://example.com"></label><div class="manage-meta">カレンダーID: {calendar_id}<br>予定ID: {event_id}</div><div class="manage-actions"><button type="submit" class="primary-button">保存する</button><span class="save-status" role="status" aria-live="polite" aria-atomic="true"></span></div></form></article>"#,
                     item_id = item_id,
                     selected_class = selected_class,
                     max_results_hidden = max_results_hidden,
@@ -2806,7 +2819,11 @@ fn render_event_manage_page(
         .event-title {{ margin: 4px 0 0; font-size: 22px; line-height: 1.25; }}
         .event-source {{ color: var(--accent); font-weight: 700; text-decoration: none; white-space: nowrap; }}
         .event-source:hover, .event-source:focus-visible {{ text-decoration: underline; }}
-        .manage-actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+        .manage-actions {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
+        .save-status {{ font-weight: 700; }}
+        .save-status.is-success {{ color: #216b35; }}
+        .save-status.is-error {{ color: #b42318; }}
+        .primary-button:disabled {{ opacity: 0.65; cursor: wait; }}
         .manage-meta {{ font-size: 12px; color: var(--muted); word-break: break-all; line-height: 1.5; }}
         .primary-button, .secondary-button, .link-button {{
             appearance: none;
@@ -2862,6 +2879,55 @@ fn render_event_manage_page(
             </div>
         </section>
     </main>
+    <script>
+        document.querySelectorAll('.manage-form').forEach((form) => {{
+            const button = form.querySelector('button[type="submit"]');
+            const status = form.querySelector('.save-status');
+            let saving = false;
+            let clearTimer;
+            form.addEventListener('submit', async (event) => {{
+                event.preventDefault();
+                if (saving) return;
+                saving = true;
+                button.disabled = true;
+                clearTimeout(clearTimer);
+                status.textContent = '';
+                status.className = 'save-status';
+                const data = new URLSearchParams(new FormData(form));
+                try {{
+                    const response = await fetch(form.action, {{
+                        method: 'POST',
+                        headers: {{ 'Accept': 'application/json' }},
+                        body: data,
+                        credentials: 'same-origin',
+                        redirect: 'error',
+                    }});
+                    if (!response.ok || response.redirected ||
+                        (response.headers.get('content-type') || '').split(';')[0].trim() !== 'application/json') {{
+                        throw new Error('Unexpected save response');
+                    }}
+                    const result = await response.json();
+                    if (result.saved !== true ||
+                        result.calendar_id !== data.get('calendar_id').trim() ||
+                        result.event_id !== data.get('event_id').trim()) {{
+                        throw new Error('Save was not confirmed');
+                    }}
+                    status.classList.add('is-success');
+                    status.textContent = '保存しました';
+                    clearTimer = setTimeout(() => {{
+                        status.textContent = '';
+                        status.className = 'save-status';
+                    }}, 3000);
+                }} catch (error) {{
+                    status.classList.add('is-error');
+                    status.textContent = 'エラーが発生しました';
+                }} finally {{
+                    saving = false;
+                    button.disabled = false;
+                }}
+            }});
+        }});
+    </script>
 </body>
 </html>"#,
         session_actions = session_actions,
@@ -4409,6 +4475,206 @@ async fn remove_session_from_db(message_db_path: &str, session_id: &str) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn event_editor_fixture() -> GoogleCalendarEventsResponse {
+        GoogleCalendarEventsResponse {
+            items: (1..=2)
+                .map(|index| GoogleCalendarEvent {
+                    id: Some(format!("event-{index}")),
+                    status: Some("confirmed".into()),
+                    summary: Some(format!("予定 {index} <テスト>")),
+                    html_link: Some("https://example.com".into()),
+                    start: Some(GoogleCalendarEventDateTime {
+                        date: Some("2026-09-17".into()),
+                        date_time: None,
+                        time_zone: None,
+                    }),
+                    end: None,
+                    source_calendar_id: Some("calendar@example.com".into()),
+                    event_memo: Some("<入力内容>".into()),
+                    event_url: None,
+                })
+                .collect(),
+            summary: None,
+            time_zone: Some("Asia/Tokyo".into()),
+        }
+    }
+
+    #[test]
+    fn event_editor_has_independent_accessible_status_regions() {
+        for authenticated in [false, true] {
+            let html = render_event_manage_page(
+                &event_editor_fixture(),
+                20,
+                authenticated,
+                Some("calendar@example.com"),
+                Some("event-2"),
+            );
+            assert_eq!(html.matches("role=\"status\"").count(), 2);
+            assert_eq!(html.matches("aria-live=\"polite\"").count(), 2);
+            assert_eq!(html.matches("name=\"max_results\" value=\"20\"").count(), 2);
+            assert!(html.contains("&lt;入力内容&gt;"));
+            assert!(!html.contains("<入力内容>"));
+            assert!(
+                html.find("value=\"event-2\"").unwrap() < html.find("value=\"event-1\"").unwrap()
+            );
+        }
+    }
+
+    fn event_test_state(db_path: String, user_auth: Option<UserAuthConfig>) -> AppState {
+        AppState {
+            client: Client::new(),
+            config: Arc::new(Config {
+                dashboard_title: "Test".into(),
+                max_results: 10,
+                port: 0,
+                oauth_client_id: String::new(),
+                oauth_client_secret: String::new(),
+                oauth_redirect_url: String::new(),
+                token_store_path: String::new(),
+                message_db_path: db_path,
+                user_auth,
+            }),
+            pending_states: Arc::new(Mutex::new(HashSet::new())),
+            user_sessions: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    async fn event_test_server(state: AppState) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/events/manage", axum::routing::post(events_manage_action))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                require_user_auth,
+            ))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/events/manage", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, server)
+    }
+
+    #[tokio::test]
+    async fn event_save_http_persists_validates_deletes_and_preserves_form_redirect()
+    -> anyhow::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("uchimachi-event-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        let db_path = directory
+            .join("test.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let (url, server) = event_test_server(event_test_state(db_path.clone(), None)).await;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let send = |memo: &str, event_url: &str, json: bool| {
+            let body = format!(
+                "calendar_id=calendar%40example.com&event_id=event-1&max_results=20&memo={}&url={}",
+                urlencoding::encode(memo),
+                urlencoding::encode(event_url)
+            );
+            client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(
+                    header::ACCEPT,
+                    if json {
+                        "application/json"
+                    } else {
+                        "text/html"
+                    },
+                )
+                .body(body)
+                .send()
+        };
+        let response = send("first", "https://example.com", true).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await?;
+        assert_eq!(body["saved"], true);
+        assert_eq!(body["calendar_id"], "calendar@example.com");
+        assert_eq!(body["event_id"], "event-1");
+        assert_eq!(send("updated", "", true).await?.status(), StatusCode::OK);
+        for (memo, link) in [
+            ("x".repeat(161), ""),
+            ("bad url".into(), "javascript:alert(1)"),
+        ] {
+            assert_eq!(
+                send(&memo, link, true).await?.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let connection = Connection::open(&db_path)?;
+        let saved: String =
+            connection.query_row("SELECT memo FROM event_annotations", [], |row| row.get(0))?;
+        assert_eq!(saved, "updated");
+        let response = send("fallback", "", false).await?;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            "/events/manage?max_results=20&calendar_id=calendar%40example.com&event_id=event-1#event-editor"
+        );
+        assert_eq!(send("", "", true).await?.status(), StatusCode::OK);
+        let count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM event_annotations", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(count, 0);
+        drop(connection);
+        server.abort();
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn event_save_failure_and_expired_auth_never_report_success() -> anyhow::Result<()> {
+        let directory =
+            std::env::temp_dir().join(format!("uchimachi-event-error-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory)?;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        for auth in [
+            None,
+            Some(UserAuthConfig {
+                username: "test".into(),
+                password: "fixture".into(),
+                cookie_secure: false,
+            }),
+        ] {
+            let requires_auth = auth.is_some();
+            // A directory cannot be opened as a SQLite database.
+            let (url, server) = event_test_server(event_test_state(
+                directory.to_string_lossy().into_owned(),
+                auth,
+            ))
+            .await;
+            let response = client
+                .post(&url)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::ACCEPT, "application/json")
+                .body("calendar_id=test&event_id=test&memo=test")
+                .send()
+                .await?;
+            if requires_auth {
+                assert_eq!(response.status(), StatusCode::SEE_OTHER);
+                assert!(
+                    response.headers()[header::LOCATION]
+                        .to_str()?
+                        .starts_with("/user/login?next=")
+                );
+            } else {
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let body: serde_json::Value = response.json().await?;
+                assert!(body.get("saved").is_none());
+            }
+            server.abort();
+        }
+        std::fs::remove_dir(directory)?;
+        Ok(())
+    }
 
     #[test]
     fn dashboard_refresh_preserves_controls_and_escapes_title() {
