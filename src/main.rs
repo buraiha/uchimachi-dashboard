@@ -339,6 +339,7 @@ struct DashboardEvent {
     event_id: Option<String>,
     memo: Option<String>,
     url: Option<String>,
+    google_url: Option<String>,
     sort_key: i64,
 }
 
@@ -2039,7 +2040,7 @@ fn render_dashboard_page(
         .primary-card:last-child {{ border-bottom: none; }}
         .event-card-head {{
             display: grid;
-            grid-template-columns: minmax(0, 1fr) 34px;
+            grid-template-columns: minmax(0, 1fr) auto;
             gap: 10px;
             align-items: start;
         }}
@@ -2079,6 +2080,8 @@ fn render_dashboard_page(
             white-space: nowrap;
         }}
         .event-link:focus-visible, .event-link:hover {{ text-decoration: underline; }}
+        .event-actions {{ display: flex; gap: 6px; align-items: start; }}
+        .event-google-button,
         .event-edit-button {{
             display: inline-flex;
             align-items: center;
@@ -2092,13 +2095,17 @@ fn render_dashboard_page(
             text-decoration: none;
             flex: 0 0 auto;
         }}
+        .event-google-button svg,
         .event-edit-button svg {{ width: 16px; height: 16px; stroke-width: 2.2; }}
+        .event-google-button:hover,
+        .event-google-button:focus-visible,
         .event-edit-button:hover,
         .event-edit-button:focus-visible {{
             color: var(--accent);
             border-color: rgba(197, 92, 59, 0.32);
             background: rgba(255,255,255,0.95);
         }}
+        .event-google-button:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
         .event-edit-button.is-disabled {{
             opacity: 0.35;
             pointer-events: none;
@@ -2174,7 +2181,7 @@ fn render_dashboard_page(
         .upcoming-copy {{ display: grid; gap: 3px; min-width: 0; }}
         .upcoming-copy-head {{
             display: grid;
-            grid-template-columns: minmax(0, 1fr) 32px;
+            grid-template-columns: minmax(0, 1fr) auto;
             gap: 8px;
             align-items: start;
         }}
@@ -3664,6 +3671,7 @@ fn render_event(event: &GoogleCalendarEvent, timezone: FixedOffset) -> Option<Da
                 event_id: event.id.clone(),
                 memo: event.event_memo.clone(),
                 url: event.event_url.clone(),
+                google_url: event.html_link.clone(),
                 sort_key,
             });
         }
@@ -3683,6 +3691,7 @@ fn render_event(event: &GoogleCalendarEvent, timezone: FixedOffset) -> Option<Da
                 event_id: event.id.clone(),
                 memo: event.event_memo.clone(),
                 url: event.event_url.clone(),
+                google_url: event.html_link.clone(),
                 sort_key,
             });
         }
@@ -3707,14 +3716,14 @@ fn render_primary_event_cards(
             let title = escape_html(&event.title);
             let time = escape_html(&event.time_label);
             let meta = render_event_meta(event);
-            let edit_button = render_event_edit_button(event, selected_max_results);
+            let actions = render_event_actions(event, selected_max_results);
 
             format!(
-                r#"<article class="primary-card"><div class="event-card-head"><div class="event-main-copy"><div class="primary-time">{time}</div><div class="primary-title">{title}</div>{meta}</div>{edit_button}</div></article>"#,
+                r#"<article class="primary-card"><div class="event-card-head"><div class="event-main-copy"><div class="primary-time">{time}</div><div class="primary-title">{title}</div>{meta}</div>{actions}</div></article>"#,
                 time = time,
                 title = title,
                 meta = meta,
-                edit_button = edit_button,
+                actions = actions,
             )
         })
         .collect::<Vec<_>>()
@@ -3767,6 +3776,21 @@ fn render_event_meta(event: &DashboardEvent) -> String {
     } else {
         format!(r#"<div class="event-meta">{memo}{link}</div>"#)
     }
+}
+
+fn render_event_actions(event: &DashboardEvent, selected_max_results: u32) -> String {
+    let google_link = normalize_event_url_input(event.google_url.clone())
+        .ok()
+        .filter(|url| !url.is_empty())
+        .map(|url| {
+            format!(
+                r#"<a class="event-google-button" href="{url}" target="_blank" rel="noopener noreferrer" aria-label="Googleカレンダーで開く" title="Googleカレンダーで開く"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="16" rx="2"/><path d="M8 3v4m8-4v4M4 10h16M8 14h2m4 0h2m-8 3h2"/></svg></a>"#,
+                url = escape_html(&url),
+            )
+        })
+        .unwrap_or_default();
+    let edit_button = render_event_edit_button(event, selected_max_results);
+    format!(r#"<div class="event-actions">{google_link}{edit_button}</div>"#)
 }
 
 fn render_event_edit_button(event: &DashboardEvent, selected_max_results: u32) -> String {
@@ -3840,15 +3864,15 @@ fn render_upcoming_event_rows(
             let time_label = escape_html(&event.time_label);
             let title = escape_html(&event.title);
             let meta = render_event_meta(event);
-            let edit_button = render_event_edit_button(event, selected_max_results);
+            let actions = render_event_actions(event, selected_max_results);
 
             format!(
-            r#"<article class="upcoming-row"><div class="upcoming-date">{date}</div><div class="upcoming-copy"><div class="upcoming-time">{time}</div><div class="upcoming-copy-head"><div class="upcoming-title">{title}</div>{edit_button}</div>{meta}</div></article>"#,
+            r#"<article class="upcoming-row"><div class="upcoming-date">{date}</div><div class="upcoming-copy"><div class="upcoming-time">{time}</div><div class="upcoming-copy-head"><div class="upcoming-title">{title}</div>{actions}</div>{meta}</div></article>"#,
             date = date_label,
             time = time_label,
             title = title,
             meta = meta,
-            edit_button = edit_button,
+            actions = actions,
             )
         })
         .collect::<Vec<_>>()
@@ -5193,6 +5217,138 @@ mod tests {
         }
     }
 
+    fn google_link_dashboard_fixture() -> GoogleCalendarEventsResponse {
+        let today = Utc::now().with_timezone(&message_timezone()).date_naive();
+        let mut events = event_editor_fixture();
+        events.items.clear();
+        for day in 0..3 {
+            let date = today + chrono::Duration::days(day);
+            for timed in [false, true] {
+                let mut event = event_editor_fixture().items.remove(0);
+                let id = format!("day-{day}-{timed}");
+                event.id = Some(id.clone());
+                event.summary = Some(format!(
+                    "{id} 長い予定名と表示確認のためのサンプル打ち合わせ <確認>"
+                ));
+                event.html_link = Some(format!(
+                    " https://calendar.google.com/calendar/event?eid={id}&label=\"sample\" "
+                ));
+                event.event_url = Some("https://example.com/related".into());
+                event.start = Some(GoogleCalendarEventDateTime {
+                    date: (!timed).then(|| date.to_string()),
+                    date_time: timed.then(|| format!("{date}T09:00:00+09:00")),
+                    time_zone: None,
+                });
+                events.items.push(event);
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn google_links_cover_all_sections_and_keep_related_links() {
+        let events = google_link_dashboard_fixture();
+        let sections = build_dashboard_sections(&events, &[]);
+        for section in [
+            &sections.today_events,
+            &sections.tomorrow_events,
+            &sections.upcoming_events,
+        ] {
+            assert_eq!(section.len(), 2);
+            assert_eq!(section[0].time_label, "終日");
+            assert!(section[1].time_label.starts_with("09:00"));
+            for event in section {
+                assert!(
+                    event
+                        .google_url
+                        .as_deref()
+                        .unwrap()
+                        .contains(event.event_id.as_deref().unwrap())
+                );
+                let actions = render_event_actions(event, 20);
+                assert!(
+                    actions.find("event-google-button").unwrap()
+                        < actions.find("event-edit-button").unwrap()
+                );
+                assert!(actions.contains("&amp;label=&quot;sample&quot;"));
+                assert!(actions.contains(r#"target="_blank" rel="noopener noreferrer""#));
+                assert!(actions.contains(
+                    r#"aria-label="Googleカレンダーで開く" title="Googleカレンダーで開く""#
+                ));
+                assert!(actions.contains(&escape_html(&event_edit_href(event, 20).unwrap())));
+                let meta = render_event_meta(event);
+                assert!(meta.contains("https://example.com/related"));
+                assert!(meta.contains("&lt;入力内容&gt;"));
+            }
+        }
+        let html = render_dashboard_page(
+            "テスト",
+            20,
+            &events,
+            &[],
+            &[],
+            ChartSettings {
+                visible: false,
+                days: 7,
+            },
+            false,
+        );
+        assert_eq!(html.matches(r#"class="event-google-button""#).count(), 6);
+        assert_eq!(html.matches(r#"class="event-edit-button""#).count(), 6);
+        assert_eq!(html.matches("【リンク】").count(), 6);
+        let editor = render_event_manage_page(&events, 20, false, None, None);
+        assert_eq!(editor.matches("Googleで開く").count(), 6);
+    }
+
+    #[test]
+    fn invalid_google_links_do_not_hide_events_or_other_actions() {
+        let invalid = [
+            None,
+            Some("".into()),
+            Some("  \t".into()),
+            Some("not a url".into()),
+            Some("javascript:alert(1)".into()),
+            Some("data:text/html,test".into()),
+            Some("ftp://example.com".into()),
+            Some(format!("https://example.com/{}", "x".repeat(2048))),
+        ];
+        for value in invalid {
+            let mut events = google_link_dashboard_fixture();
+            for event in &mut events.items {
+                event.html_link = value.clone();
+            }
+            let html = render_dashboard_page(
+                "テスト",
+                20,
+                &events,
+                &[],
+                &[],
+                ChartSettings {
+                    visible: false,
+                    days: 7,
+                },
+                false,
+            );
+            assert!(!html.contains(r#"class="event-google-button""#));
+            assert_eq!(html.matches(r#"class="event-edit-button""#).count(), 6);
+            assert_eq!(html.matches("【リンク】").count(), 6);
+            for event in &events.items {
+                assert!(html.contains(&escape_html(event.summary.as_deref().unwrap())));
+            }
+        }
+        let mut event = render_event(
+            &google_link_dashboard_fixture().items[0],
+            message_timezone(),
+        )
+        .unwrap();
+        for scheme in ["http", "https"] {
+            let prefix = format!("{scheme}://example.com/");
+            let url = format!("{prefix}{}", "x".repeat(2048 - prefix.len()));
+            event.google_url = Some(url.clone());
+            assert!(render_event_actions(&event, 20).contains(&url));
+        }
+    }
+
     #[test]
     fn event_editor_has_independent_accessible_status_regions() {
         for authenticated in [false, true] {
@@ -5532,6 +5688,7 @@ mod tests {
             event_id: None,
             memo: Some("資料を確認".to_string()),
             url: None,
+            google_url: None,
             sort_key: 0,
         }];
 
