@@ -2,13 +2,14 @@
 
 このファイルには、AIの調査、変更、検証へ直接影響するプロジェクト固有の契約だけを記載する。
 
-AIの共通行動規範は `AGENTS.md` と `.ai/common.md`、詳しい仕様と運用手順は `README.md` を参照すること。
+AIの共通行動規範は `AGENTS.md` と `.ai/common.md`、合意済みの要件は `docs/requirements.md`、現行実装の説明と運用手順は `README.md` を参照すること。
 
 ## 1. Project Overview
 
 - 概要: Google Calendar APIから複数カレンダーの予定を取得し、伝言、予定メモ、スケジュールチャートとともに表示する単一バイナリのWebダッシュボード
 - 主な技術: Rust 2024、Axum、Tokio、SQLite（rusqlite）、Google Calendar API、OAuth 2.0
-- 仕様・設計の参照先: `README.md`
+- 要件正本: `docs/requirements.md`
+- 現行実装・運用手順の参照先: `README.md`
 
 ## 2. Repository Boundaries
 
